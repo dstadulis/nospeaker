@@ -540,7 +540,7 @@ public struct SafeTouchContact: Sendable, Equatable {
             return .idle
         }
         var best = SafeTouchContact.idle
-        for i in 0..<Int(count) {
+        for i in 0..<min(Int(count), 4) {
             let rec = base.advanced(by: i * recordStride)
             let state = rec.loadUnaligned(fromByteOffset: 20, as: Int32.self)
             guard (3...5).contains(state) else { continue }

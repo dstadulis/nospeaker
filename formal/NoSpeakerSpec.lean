@@ -1805,6 +1805,15 @@ theorem foldSpeechScalar_sound (cp outByte : Nat) (h : foldSpeechScalar cp = som
           omega
         · simp [h4] at h
 
+/-- PROOF 14.5 (`onTouchFrame` `idx < min(count, 4)` Dual-ABI 88B/96B OOB Immunity):
+    Capping scanned contacts at `min count 4` guarantees `idx * 96 + 52 ≤ count * 88`
+    for ALL `count ≥ 1`, preventing out-of-bounds driver buffer reads even across undocumented
+    88-byte vs 96-byte `MTTouch` struct ABI layouts! -/
+theorem mttouch_min4_cap_prevents_88b_oob (idx count : Nat)
+    (hcnt : 1 ≤ count) (hidx : idx < min count 4) :
+    idx * 96 + 52 ≤ count * 88 := by
+  omega
+
 end ConcreteRefinement
 
 end NoSpeakerFormal
@@ -1853,3 +1862,4 @@ end NoSpeakerFormal
 #print axioms NoSpeakerFormal.ConcreteRefinement.two_sigints_stop_runController
 #print axioms NoSpeakerFormal.ConcreteRefinement.isVerifiedSingleColumnGlyph_safe
 #print axioms NoSpeakerFormal.ConcreteRefinement.foldSpeechScalar_sound
+#print axioms NoSpeakerFormal.ConcreteRefinement.mttouch_min4_cap_prevents_88b_oob
