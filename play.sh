@@ -12,7 +12,8 @@ set -eu
 umask 077
 PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
-IFS=$(printf ' \t\n')
+IFS=$(printf ' \t\nx')
+IFS="${IFS%x}"
 
 fail() {
     printf '\n  nospeaker: %s\n\n' "$1" >&2
@@ -56,7 +57,11 @@ if [ -n "${NOSPEAKER_SHA256:-}" ]; then
 elif curl --proto '=https' --tlsv1.2 --max-redirs 5 -fsSL --connect-timeout 10 --max-time 30 --max-filesize 4096 \
     -- "${url}.sha256" -o "$tmp/nospeaker.zip.sha256" 2>/dev/null; then
     expected_sha=$(awk 'NR==1 {print $1}' "$tmp/nospeaker.zip.sha256" | tr 'A-F' 'a-f')
-elif [ "${NOSPEAKER_REQUIRE_SHA256:-0}" = "1" ]; then
+    [ -n "$expected_sha" ] \
+        || fail "downloaded nospeaker.zip.sha256 is empty or malformed; refusing to install."
+fi
+
+if [ "${NOSPEAKER_REQUIRE_SHA256:-0}" = "1" ] && [ -z "$expected_sha" ]; then
     fail "SHA-256 verification required (NOSPEAKER_REQUIRE_SHA256=1), but no digest was provided."
 fi
 

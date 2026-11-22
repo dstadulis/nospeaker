@@ -6,7 +6,8 @@
 #                         dist/nospeaker.zip, which runs on any Mac without security warnings
 set -eu
 umask 077
-IFS=$(printf ' \t\n')
+IFS=$(printf ' \t\nx')
+IFS="${IFS%x}"
 
 fail() {
     printf '\n  nospeaker: %s\n\n' "$1" >&2
@@ -40,8 +41,8 @@ if [ -z "$major" ] || [ -z "$minor" ] || [ "$major" -lt 6 ]; then
   (Software Update, or: xcode-select --install)."
 fi
 
-if [ -L build ] || [ -L nospeaker ] || [ -L dist ]; then
-    fail "refusing to write through symbolic links in the build directory."
+if [ -L build ] || [ -L nospeaker ] || [ -L dist ] || [ -d nospeaker ]; then
+    fail "refusing to write through symbolic links or overwrite a directory at ./nospeaker."
 fi
 
 mkdir -p -- build
