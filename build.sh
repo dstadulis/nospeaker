@@ -4,14 +4,21 @@
 #   ./build.sh            build ./nospeaker (signed for this Mac only)
 #   ./build.sh release    also sign it with your Developer ID, have Apple notarize it, and make
 #                         dist/nospeaker.zip, which runs on any Mac without security warnings
-set -e
-mode="$1"
-cd "$(dirname "$0")"
+set -eu
+umask 077
+IFS=$(printf ' \t\n')
 
 fail() {
     printf '\n  nospeaker: %s\n\n' "$1" >&2
     exit 1
 }
+
+mode="${1:-}"
+if [ "$#" -gt 1 ] || { [ -n "$mode" ] && [ "$mode" != "release" ]; }; then
+    fail "usage: ./build.sh [release]"
+fi
+
+cd -- "$(dirname -- "$0")"
 
 [ "$(uname -s)" = "Darwin" ] || fail "this builds on macOS only (it drives a Mac's trackpad)."
 
@@ -22,25 +29,41 @@ fail() {
 
   then run ./build.sh again."
 
-# Swift 5.7 or newer (Xcode 14 or later).
-version=$(swiftc --version 2>/dev/null | sed -n 's/.*Swift version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
-set -- $version
-if [ -z "$1" ] || [ "$1" -lt 5 ] || { [ "$1" -eq 5 ] && [ "$2" -lt 7 ]; }; then
-    fail "this needs Swift 5.7 or newer, and found ${1:-?}.${2:-?}. Update Xcode or the Command Line Tools
+# Swift 6.0 or newer (strict concurrency complete checking).
+ver_line=$(swiftc --version 2>/dev/null | sed -n 's/.*Swift version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1.\2/p' | head -n 1)
+major="${ver_line%%.*}"
+minor="${ver_line#*.}"
+case "$major" in ''|*[!0-9]*) major="" ;; esac
+case "$minor" in ''|*[!0-9]*) minor="" ;; esac
+if [ -z "$major" ] || [ -z "$minor" ] || [ "$major" -lt 6 ]; then
+    fail "this needs Swift 6.0 or newer, and found ${major:-?}.${minor:-?}. Update Xcode or the Command Line Tools
   (Software Update, or: xcode-select --install)."
 fi
 
-mkdir -p build
+if [ -L build ] || [ -L nospeaker ] || [ -L dist ]; then
+    fail "refusing to write through symbolic links in the build directory."
+fi
+
+mkdir -p -- build
+set -- -O -swift-version 6 -strict-concurrency=complete
+if [ -n "${SWIFT_MODULE_CACHE_PATH:-}" ]; then
+    set -- "$@" -module-cache-path "$SWIFT_MODULE_CACHE_PATH"
+fi
+
 echo "building for Apple Silicon…"
-swiftc -O -target arm64-apple-macos12 nospeaker.swift -o build/nospeaker-arm64 \
+swiftc "$@" -target arm64-apple-macos12 nospeaker.swift -o build/nospeaker-arm64 \
     || fail "the Apple Silicon build failed (errors above). Make sure Xcode or the Command Line Tools are up to date."
 echo "building for Intel…"
-swiftc -O -target x86_64-apple-macos13 nospeaker.swift -o build/nospeaker-x86_64 \
+swiftc "$@" -target x86_64-apple-macos13 nospeaker.swift -o build/nospeaker-x86_64 \
     || fail "the Intel build failed (errors above). Make sure Xcode or the Command Line Tools are up to date."
 
 lipo -create build/nospeaker-arm64 build/nospeaker-x86_64 -output build/nospeaker
-codesign -s - -f build/nospeaker 2>/dev/null
-mv -f build/nospeaker nospeaker     # a rename, so a copy that's already running isn't disturbed
+chmod 0755 build/nospeaker
+codesign -s - -f build/nospeaker \
+    || fail "local ad-hoc code signing failed."
+codesign --verify --strict build/nospeaker \
+    || fail "local code signature verification failed."
+mv -f -- build/nospeaker nospeaker     # atomic rename, so a copy that's already running isn't disturbed
 echo "built ./nospeaker ($(lipo -archs nospeaker)). Run it with: ./nospeaker"
 
 [ "$mode" = "release" ] || exit 0
@@ -52,6 +75,10 @@ identity=$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer I
   then run ./build.sh release again."
 
 profile="${NOTARY_PROFILE:-nospeaker}"
+case "$profile" in
+    ''|*[!A-Za-z0-9._-]*|-*) fail "NOTARY_PROFILE must contain only letters, digits, '.', '_', or '-'." ;;
+esac
+
 xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1 || fail "no saved notary sign-in called \"$profile\". Save one once (it asks for an app-specific password,
   made at account.apple.com > Sign-In and Security > App-Specific Passwords):
 
@@ -63,8 +90,8 @@ echo "signing with $identity…"
 codesign --force --options runtime --timestamp --sign "$identity" nospeaker
 codesign --verify --strict nospeaker
 
-mkdir -p dist
-rm -f dist/nospeaker.zip
+mkdir -p -- dist
+rm -f -- dist/nospeaker.zip dist/nospeaker.zip.sha256
 ditto -c -k --norsrc --noextattr nospeaker dist/nospeaker.zip    # the program alone, at the top of the zip
 
 echo "sending to Apple for notarization (usually a minute or two)…"
@@ -73,4 +100,6 @@ xcrun notarytool submit dist/nospeaker.zip --keychain-profile "$profile" --wait 
 
 codesign --verify --strict -R="notarized" --check-notarization nospeaker \
     || fail "Apple accepted it, but macOS can't confirm the notarization yet. Try again in a minute."
-echo "released: dist/nospeaker.zip, signed and notarized. Attach it to the GitHub release."
+shasum -a 256 dist/nospeaker.zip > dist/nospeaker.zip.sha256
+chmod 0644 dist/nospeaker.zip dist/nospeaker.zip.sha256
+echo "released: dist/nospeaker.zip (+ .sha256), signed and notarized. Attach them to the GitHub release."
