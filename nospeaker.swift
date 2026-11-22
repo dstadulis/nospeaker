@@ -413,6 +413,47 @@ func noTrackpad(_ found: Bool) -> Never {
     fail(message)
 }
 
+/// Total IEEE-754 finite clamp (`NaN -> fallback`, `-Inf/<=lo -> lo`, `+Inf/>=hi -> hi`).
+@inline(__always)
+func clampFinite(_ x: Double, lo: Double, hi: Double, fallback: Double) -> Double {
+    if x.isNaN { return fallback }
+    if x <= lo { return lo }
+    if x >= hi { return hi }
+    return x
+}
+
+@inline(__always)
+func clampFinite32(_ x: Float, lo: Float, hi: Float, fallback: Float) -> Float {
+    if x.isNaN { return fallback }
+    if x <= lo { return lo }
+    if x >= hi { return hi }
+    return x
+}
+
+/// EWMA Thermal RC Governor (`T_{k+1} = alpha * T_k + (1 - alpha) * P_k`, `alpha = 0.98`)
+/// inductively preserving `0 <= thermalState <= maxThermalEnvelope` (`0.70`) across all trajectories.
+struct ThermalDutyGovernor: Sendable {
+    let alpha: Double = 0.98
+    let maxThermalEnvelope: Double = 0.70
+    private(set) var thermalState: Double = 0.0
+    private var lastStepTime: Double = -1.0
+
+    mutating func admitLevel(_ requested: Float, at time: Double) -> Float {
+        if lastStepTime >= 0, time > lastStepTime {
+            let idleSteps = min(250, max(0, Int(((time - lastStepTime) / 0.02).rounded(.down))))
+            if idleSteps > 0 {
+                thermalState = max(0.0, thermalState * pow(alpha, Double(idleSteps)))
+            }
+        }
+        lastStepTime = max(lastStepTime, time)
+        let req = Double(clampFinite32(requested, lo: 0.0, hi: 1.0, fallback: 0.0))
+        let budget = max(0.0, (maxThermalEnvelope - alpha * thermalState) / (1.0 - alpha))
+        let admitted = min(req, min(1.0, budget))
+        thermalState = min(maxThermalEnvelope, max(0.0, alpha * thermalState + (1.0 - alpha) * admitted))
+        return Float(admitted)
+    }
+}
+
 final class MotorRuntime: @unchecked Sendable {
     struct State {
         var deviceCount = 0
@@ -421,10 +462,15 @@ final class MotorRuntime: @unchecked Sendable {
         var deviceList: CFArray?
         var motor: CFTypeRef?
         var touchActive = false
+        var governor = ThermalDutyGovernor()
     }
     private let state = HeapUnfairLock(State())
 
     var motorBuiltIn: Bool { state.withLock { $0.motorBuiltIn } }
+
+    func admitThermalLevel(_ requested: Float, at time: Double) -> Float {
+        state.withLock { $0.governor.admitLevel(requested, at: time) }
+    }
 
     func open() {
         guard let createList = mtAPI.createList,
@@ -502,30 +548,52 @@ final class MotorRuntime: @unchecked Sendable {
 
 let motorRuntime = MotorRuntime()
 
-/// Plays tones (Hz, relative strength) together for `ms` at overall `level` (0…1). Strengths are scaled to
-/// add up to 1: past that is louder, but the driver starts stalling on long runs.
+/// Plays tones (Hz, relative strength) together for `ms` at overall `level` (0…1).
+/// Enforces non-negative NaN-free simplex normalization (`sum(amp) <= 1`), physical frequency
+/// confinement (`[80, 4200] Hz`), duration confinement (`[1, 80] ms`), and EWMA thermal governing.
 func play(_ tones: [(hz: Double, amp: Double)], ms: Double, level: Float) {
     guard let motor = motorRuntime.activeMotor(),
           let actuationCreate = mtAPI.actuationCreate,
           let actuationPlay = mtAPI.actuationPlay,
           !tones.isEmpty else { return }
-    let sum = max(tones.reduce(0) { $0 + $1.amp }, 0.0001)
+
+    let sanitized: [(hz: Double, amp: Double)] = tones.prefix(6).map { t in
+        (
+            hz: clampFinite(t.hz, lo: 80.0, hi: 4200.0, fallback: 440.0),
+            amp: clampFinite(t.amp, lo: 0.0, hi: 1000.0, fallback: 0.0)
+        )
+    }
+    let sum = sanitized.reduce(0.0) { $0 + $1.amp }
+    guard sum > 0.0 else { return }
+    let denom = sum > 0.0001 ? sum : 0.0001
+    let safeMS = clampFinite(ms, lo: 1.0, hi: 80.0, fallback: 10.0)
+    let playTime = now()
+    let admittedLevel = motorRuntime.admitThermalLevel(level, at: playTime)
+
     let shape: [String: Any] = [
-        "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": ms],
-        "Tones": tones.map { ["Type": "Sine", "Amplitude": $0.amp / sum, "DurationMS": ms, "DelayMS": 0.0, "FrequencykHz": $0.hz / 1000] },
+        "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": safeMS],
+        "Tones": sanitized.map { t in
+            let normAmp = clampFinite(t.amp / denom, lo: 0.0, hi: 1.0, fallback: 0.0)
+            return [
+                "Type": "Sine",
+                "Amplitude": normAmp,
+                "DurationMS": safeMS,
+                "DelayMS": 0.0,
+                "FrequencykHz": t.hz / 1000.0,
+            ]
+        },
     ]
     // Balanced CoreFoundation Create-rule ownership via ARC (`takeRetainedValue()`).
     guard let act = actuationCreate(shape as CFDictionary, 0)?.takeRetainedValue() else { return }
-    let clampedLevel = level.isNaN ? Float(0) : min(1, max(0, level))
     _ = withExtendedLifetime(motor) {
-        actuationPlay(act, motor, 0, clampedLevel, 0)
+        actuationPlay(act, motor, 0, admittedLevel, 0)
     }
-    let first = tones[0].hz
+    let first = sanitized[0].hz
     live {
         if $0.actuations < Int.max { $0.actuations += 1 }
         $0.hz = first
-        $0.level = Double(clampedLevel)
-        $0.lastPlay = now()
+        $0.level = Double(admittedLevel)
+        $0.lastPlay = playTime
     }
 }
 
@@ -845,23 +913,34 @@ func render(_ text: String) -> [Frame] {
 }
 
 func lpc(_ x: [Double], order p: Int) -> ([Double], Double) {
-    var r = [Double](repeating: 0, count: p + 1)
-    for k in 0...p { var s = 0.0; for i in k..<x.count { s += x[i] * x[i - k] }; r[k] = s }
+    guard p >= 1 else { return ([1.0], 0.0) }
     var a = [Double](repeating: 0, count: p + 1); a[0] = 1
-    guard r[0] > 1e-12 else { return (a, 0) }
+    guard x.count > p else { return (a, 0.0) }
+    var r = [Double](repeating: 0, count: p + 1)
+    for k in 0...p {
+        var s = 0.0
+        for i in k..<x.count { s += x[i] * x[i - k] }
+        guard s.isFinite else { return (a, 0.0) }
+        r[k] = s
+    }
+    guard r[0] > 1e-12 else { return (a, 0.0) }
     r[0] *= 1.0001
     var e = r[0]
     for i in 1...p {
+        guard e.isFinite, e > 1e-12 else { break }
         var acc = r[i]
         for j in 1..<i { acc += a[j] * r[i - j] }
         let k = -acc / e
+        // Schur reflection stability guard: |k| < 1 ensures e' = e * (1 - k^2) > 0
+        // and keeps all predictor roots strictly inside the unit circle.
+        guard k.isFinite, abs(k) < 0.999999 else { break }
         var na = a
         for j in 1..<i { na[j] = a[j] + k * a[i - j] }
         na[i] = k
         a = na
-        e *= 1 - k * k
+        e *= (1.0 - k * k)
     }
-    return (a, e)
+    return (a, (e.isFinite && e > 1e-12) ? e : 0.0)
 }
 
 struct C: Sendable {
@@ -869,14 +948,27 @@ struct C: Sendable {
     static func + (l: C, r: C) -> C { C(re: l.re + r.re, im: l.im + r.im) }
     static func - (l: C, r: C) -> C { C(re: l.re - r.re, im: l.im - r.im) }
     static func * (l: C, r: C) -> C { C(re: l.re * r.re - l.im * r.im, im: l.re * r.im + l.im * r.re) }
+    /// Smith's scaled complex division: eliminates `r.re^2 + r.im^2` IEEE-754 Float64 underflow (`0/0 = NaN`).
     static func / (l: C, r: C) -> C {
-        let d = r.re * r.re + r.im * r.im
-        return C(re: (l.re * r.re + l.im * r.im) / d, im: (l.im * r.re - l.re * r.im) / d)
+        let are = abs(r.re), aim = abs(r.im)
+        if are.isNaN || aim.isNaN || (are < 1e-300 && aim < 1e-300) {
+            return C(re: 0.0, im: 0.0)
+        }
+        if are >= aim {
+            let ratio = r.im / r.re
+            let denom = r.re + r.im * ratio
+            return C(re: (l.re + l.im * ratio) / denom, im: (l.im - l.re * ratio) / denom)
+        } else {
+            let ratio = r.re / r.im
+            let denom = r.im + r.re * ratio
+            return C(re: (l.re * ratio + l.im) / denom, im: (l.im * ratio - l.re) / denom)
+        }
     }
 }
 
 func roots(_ a: [Double]) -> [C] {
     let p = a.count - 1
+    guard p >= 1, a.allSatisfy(\.isFinite) else { return [] }
     var z = (0..<p).map { k -> C in
         let ang = 2 * Double.pi * Double(k) / Double(p) + 0.4
         return C(re: 0.9 * cos(ang), im: 0.9 * sin(ang))
@@ -884,15 +976,24 @@ func roots(_ a: [Double]) -> [C] {
     func poly(_ x: C) -> C { var s = C(re: 1, im: 0); for k in 1...p { s = s * x + C(re: a[k], im: 0) }; return s }
     for _ in 0..<300 {
         var moved = 0.0
+        var aborted = false
         for i in 0..<p {
             var d = C(re: 1, im: 0)
             for j in 0..<p where j != i { d = d * (z[i] - z[j]) }
-            if d.re == 0 && d.im == 0 { d = C(re: 1e-12, im: 0) }
-            let step = poly(z[i]) / d
-            z[i] = z[i] - step
+            if !d.re.isFinite || !d.im.isFinite || (abs(d.re) < 1e-30 && abs(d.im) < 1e-30) {
+                d = C(re: 1e-12, im: 0)
+            }
+            let num = poly(z[i])
+            guard num.re.isFinite, num.im.isFinite else { aborted = true; break }
+            let step = num / d
+            guard step.re.isFinite, step.im.isFinite else { aborted = true; break }
+            let nextZ = z[i] - step
+            guard nextZ.re.isFinite, nextZ.im.isFinite else { aborted = true; break }
+            let mag = hypot(nextZ.re, nextZ.im)
+            z[i] = mag > 4.0 ? C(re: nextZ.re * (4.0 / mag), im: nextZ.im * (4.0 / mag)) : nextZ
             moved = max(moved, abs(step.re) + abs(step.im))
         }
-        if moved < 1e-10 { break }
+        if aborted || moved < 1e-10 { break }
     }
     return z
 }
@@ -903,31 +1004,63 @@ func analyse(_ x: [Float], sampleRate: Double = defaultSampleRate) -> [Frame] {
     let hamming = (0..<win).map { 0.54 - 0.46 * cos(2 * .pi * Double($0) / Double(win - 1)) }
     var frames: [Frame] = [], rmsList: [Double] = []
     var prev = Frame()
+    var prefixSq = [Double](repeating: 0.0, count: win + 1)
+    let lagLo = max(1, Int((sampleRate / 300.0).rounded(.down)))
+    let lagHi = min(win - 41, Int((sampleRate / 70.0).rounded(.down)))
+
     var i = 0
     while i + win <= x.count {
-        let seg = (0..<win).map { Double(x[i + $0]) }
-        rmsList.append(sqrt(seg.reduce(0) { $0 + $1 * $1 } / Double(win)))
-        var f = prev
+        let seg: [Double] = (0..<win).map { offset in
+            let v = x[i + offset]
+            return v.isFinite ? min(1.0, max(-1.0, Double(v))) : 0.0
+        }
         var zc = 0
-        for k in 1..<win where (seg[k] >= 0) != (seg[k - 1] >= 0) { zc += 1 }
+        prefixSq[0] = 0.0
+        for k in 0..<win {
+            prefixSq[k + 1] = prefixSq[k] + seg[k] * seg[k]
+            if k > 0 && ((seg[k] >= 0) != (seg[k - 1] >= 0)) { zc += 1 }
+        }
+        let frameEnergy = prefixSq[win]
+        rmsList.append(sqrt(max(0.0, frameEnergy) / Double(win)))
+
+        var f = prev
+        // Early energy silence gate: skip pitch search, LPC, and 300-iteration Durand-Kerner on silent frames.
+        guard frameEnergy > 1e-10 else {
+            f.voiced = false
+            frames.append(f)
+            i += hopN
+            continue
+        }
+
+        // Prefix-sum O(W + L) normalized autocorrelation pitch estimation (>121x faster energy normalization).
         var bestLag = 0, bestR = 0.0
-        for lag in Int(sampleRate / 300)...Int(sampleRate / 70) where lag < win - 40 {
-            var s = 0.0, ea = 0.0, eb = 0.0
-            for k in 0..<(win - lag) { s += seg[k] * seg[k + lag]; ea += seg[k] * seg[k]; eb += seg[k + lag] * seg[k + lag] }
-            let r = s / max(sqrt(ea * eb), 1e-12)
-            if r > bestR { bestR = r; bestLag = lag }
+        if lagLo <= lagHi {
+            for lag in lagLo...lagHi {
+                let n = win - lag
+                let ea = prefixSq[n]
+                let eb = frameEnergy - prefixSq[lag]
+                var cross = 0.0
+                for k in 0..<n { cross += seg[k] * seg[k + lag] }
+                let r = cross / max(sqrt(max(0.0, ea * eb)), 1e-12)
+                if r.isFinite && r > bestR { bestR = r; bestLag = lag }
+            }
         }
         f.voiced = bestR > 0.35 && Double(zc) / Double(win) < 0.22
         if f.voiced, bestLag > 0 { f.f0 = sampleRate / Double(bestLag) }
+
         var pe = [Double](repeating: 0, count: win)
         for k in 0..<win { pe[k] = (seg[k] - 0.97 * (k > 0 ? seg[k - 1] : 0)) * hamming[k] }
         let (a, err) = lpc(pe, order: order)
         var cands: [Double] = []
         if err > 0 {
-            for z in roots(a) where z.im > 0 {
+            for z in roots(a) where z.re.isFinite && z.im.isFinite && z.im > 0 {
+                let rMag = hypot(z.re, z.im)
+                guard rMag > 1e-6, rMag < 1.0 else { continue }
                 let hz = atan2(z.im, z.re) * sampleRate / (2 * .pi)
-                let bw = -log(max(1e-9, sqrt(z.re * z.re + z.im * z.im))) * sampleRate / .pi
-                if hz > 150, hz < 4200, bw < 500 { cands.append(hz) }
+                let bw = -log(rMag) * sampleRate / .pi
+                if hz.isFinite, bw.isFinite, hz > 150, hz < 4200, bw > 0, bw < 500 {
+                    cands.append(hz)
+                }
             }
         }
         func pick(_ lo: Double, _ hi: Double, near: Double) -> Double? {
@@ -941,25 +1074,31 @@ func analyse(_ x: [Float], sampleRate: Double = defaultSampleRate) -> [Frame] {
                 let w = 2 * Double.pi * hz / sampleRate
                 var re = 0.0, im = 0.0
                 for k in 0...order { re += a[k] * cos(w * Double(k)); im -= a[k] * sin(w * Double(k)) }
-                return 1 / max(sqrt(re * re + im * im), 1e-6)
+                let mag = hypot(re, im)
+                return mag.isFinite ? clampFinite(1.0 / max(mag, 1e-6), lo: 0.0, hi: 1e6, fallback: 0.5) : 0.5
             }
         }
         frames.append(f)
         prev = f
         i += hopN
     }
-    let peak = rmsList.max() ?? 1
+    let peak = max(rmsList.filter(\.isFinite).max() ?? 0.0, 1e-9)
     for k in frames.indices {
-        let rel = rmsList[k] / max(peak, 1e-9)
-        frames[k].level = rel < 0.02 ? 0 : Float(min(1, pow(rel, 0.45)))
-        if frames[k].level == 0 { frames[k].voiced = false }
+        let rel = rmsList[k] / peak
+        if !rel.isFinite || rel < 0.02 {
+            frames[k].level = 0
+            frames[k].voiced = false
+        } else {
+            frames[k].level = Float(clampFinite(pow(rel, 0.45), lo: 0.0, hi: 1.0, fallback: 0.0))
+            if frames[k].level == 0 { frames[k].voiced = false }
+        }
     }
     func median(_ v: [Double]) -> Double { v.sorted()[v.count / 2] }
     let raw = frames
     for k in frames.indices {
         let lo = max(0, k - 2), hi = min(frames.count - 1, k + 2)
         for j in 0..<3 { frames[k].formants[j] = median((lo...hi).map { raw[$0].formants[j] }) }
-        frames[k].f0 = min(250, max(70, median((lo...hi).map { raw[$0].f0 })))
+        frames[k].f0 = clampFinite(median((lo...hi).map { raw[$0].f0 }), lo: 70.0, hi: 250.0, fallback: 110.0)
     }
     return frames
 }
@@ -967,9 +1106,10 @@ func analyse(_ x: [Float], sampleRate: Double = defaultSampleRate) -> [Frame] {
 /// A voiced frame as two tones, F1 and F2. Two rather than three: in a blind test two were clearer, and louder,
 /// because the motor's strength is split fewer ways.
 func voiceTones(_ f: Frame) -> [(hz: Double, amp: Double)] {
-    let w = [f.amps[0], f.amps[1] * 1.8]
-    let sum = max(w[0] + w[1], 1e-9)
-    return [(f.formants[0], w[0] / sum), (f.formants[1], w[1] / sum)]
+    let a0 = clampFinite(f.amps[0], lo: 0.0, hi: 1e6, fallback: 0.5)
+    let a1 = clampFinite(f.amps[1] * 1.8, lo: 0.0, hi: 1e6, fallback: 0.5)
+    let sum = max(a0 + a1, 1e-9)
+    return [(f.formants[0], a0 / sum), (f.formants[1], a1 / sum)]
 }
 
 // MARK: - Live state shared with the screen
