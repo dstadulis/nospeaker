@@ -45,7 +45,7 @@ chmod 0700 -- "$tmp"
 trap 'rm -rf -- "$tmp"' EXIT INT TERM HUP
 
 echo "downloading nospeaker…"
-curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 120 --max-filesize 52428800 \
+curl --proto '=https' --tlsv1.2 --max-redirs 5 -fsSL --connect-timeout 10 --max-time 60 --max-filesize 20971520 \
     -- "$url" -o "$tmp/nospeaker.zip" \
     || fail "the download failed. Check your connection, or get it from github.com/os6/nospeaker/releases"
 
@@ -53,7 +53,7 @@ curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 120 --max-
 expected_sha=""
 if [ -n "${NOSPEAKER_SHA256:-}" ]; then
     expected_sha=$(printf '%s' "$NOSPEAKER_SHA256" | tr 'A-F' 'a-f')
-elif curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 30 --max-filesize 4096 \
+elif curl --proto '=https' --tlsv1.2 --max-redirs 5 -fsSL --connect-timeout 10 --max-time 30 --max-filesize 4096 \
     -- "${url}.sha256" -o "$tmp/nospeaker.zip.sha256" 2>/dev/null; then
     expected_sha=$(awk 'NR==1 {print $1}' "$tmp/nospeaker.zip.sha256" | tr 'A-F' 'a-f')
 elif [ "${NOSPEAKER_REQUIRE_SHA256:-0}" = "1" ]; then
@@ -113,22 +113,23 @@ if [ -L "$local_dir" ] || [ -L "$dest" ]; then
 fi
 mkdir -p -- "$dest"
 [ -d "$dest" ] && [ ! -L "$dest" ] || fail "~/.local/bin is not a regular directory."
-if [ -L "$dest/nospeaker" ]; then
-    fail "refusing to overwrite symbolic link at ~/.local/bin/nospeaker."
+if [ -L "$dest/nospeaker" ] || [ -d "$dest/nospeaker" ]; then
+    fail "refusing to overwrite symbolic link or directory at ~/.local/bin/nospeaker."
 fi
 
 staged="$dest/.nospeaker.tmp.$$"
 rm -f -- "$staged"
-cp -f -- "$bin" "$staged"
-chmod 0700 -- "$staged"
+install -m 0755 -- "$bin" "$staged"
 mv -f -- "$staged" "$dest/nospeaker"
 
 rm -rf -- "$tmp"
 trap - EXIT INT TERM HUP
 echo "installed ~/.local/bin/nospeaker"
 
-# Piped into sh, stdin is the script itself, so give the show the keyboard back when a TTY is available.
-if { true </dev/tty; } 2>/dev/null; then
+# Piped into sh, stdin is the script itself, so rebind /dev/tty only when stdin is not already a TTY.
+if [ -t 0 ]; then
+    exec "$dest/nospeaker" "$@"
+elif [ -r /dev/tty ] && { true </dev/tty; } 2>/dev/null; then
     exec "$dest/nospeaker" "$@" </dev/tty
 else
     exec "$dest/nospeaker" "$@" </dev/null

@@ -69,10 +69,29 @@ echo "built ./nospeaker ($(lipo -archs nospeaker)). Run it with: ./nospeaker"
 [ "$mode" = "release" ] || exit 0
 
 # Release: Developer ID signature (with the hardened runtime Apple requires), then notarization.
-identity=$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1)
-[ -n "$identity" ] || fail "no Developer ID Application certificate in your keychain. Add one in Xcode:
+# Select unambiguous 40-hex SHA-1 certificate fingerprint (or explicit CODESIGN_IDENTITY).
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    case "$CODESIGN_IDENTITY" in
+        *[!0-9A-Fa-f]*) fail "CODESIGN_IDENTITY must be a 40-character hex SHA-1 certificate hash." ;;
+    esac
+    [ "${#CODESIGN_IDENTITY}" -eq 40 ] \
+        || fail "CODESIGN_IDENTITY must be a 40-character hex SHA-1 certificate hash."
+    identity="$CODESIGN_IDENTITY"
+else
+    hashes=$(security find-identity -v -p codesigning \
+        | awk '/"Developer ID Application:/ { print $2 }' \
+        | sort -u)
+    count=$(printf '%s\n' "$hashes" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [ "$count" -eq 0 ]; then
+        fail "no Developer ID Application certificate in your keychain. Add one in Xcode:
   Settings > Accounts > your team > Manage Certificates > + > Developer ID Application,
   then run ./build.sh release again."
+    elif [ "$count" -gt 1 ]; then
+        fail "multiple Developer ID Application certificates found in keychain; set CODESIGN_IDENTITY=<40-hex SHA-1>
+  from 'security find-identity -v -p codesigning' and run ./build.sh release again."
+    fi
+    identity="$hashes"
+fi
 
 profile="${NOTARY_PROFILE:-nospeaker}"
 case "$profile" in
@@ -86,20 +105,27 @@ xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1 || fail "
 
   then run ./build.sh release again."
 
-echo "signing with $identity…"
+echo "signing with Developer ID ($identity)…"
 codesign --force --options runtime --timestamp --sign "$identity" nospeaker
 codesign --verify --strict nospeaker
 
-mkdir -p -- dist
-rm -f -- dist/nospeaker.zip dist/nospeaker.zip.sha256
-ditto -c -k --norsrc --noextattr nospeaker dist/nospeaker.zip    # the program alone, at the top of the zip
+# Stage archive inside build/ and promote to dist/nospeaker.zip strictly after notarization passes.
+rm -f -- dist/nospeaker.zip dist/nospeaker.zip.sha256 build/nospeaker-staging.zip
+ditto -c -k --norsrc --noextattr nospeaker build/nospeaker-staging.zip
 
 echo "sending to Apple for notarization (usually a minute or two)…"
-xcrun notarytool submit dist/nospeaker.zip --keychain-profile "$profile" --wait \
-    || fail "notarization didn't pass. See why with: xcrun notarytool log <submission id> --keychain-profile $profile"
+if ! xcrun notarytool submit build/nospeaker-staging.zip --keychain-profile "$profile" --wait; then
+    rm -f -- build/nospeaker-staging.zip
+    fail "notarization didn't pass. See why with: xcrun notarytool log <submission id> --keychain-profile $profile"
+fi
 
-codesign --verify --strict -R="notarized" --check-notarization nospeaker \
-    || fail "Apple accepted it, but macOS can't confirm the notarization yet. Try again in a minute."
+if ! codesign --verify --strict -R="notarized" --check-notarization nospeaker; then
+    rm -f -- build/nospeaker-staging.zip
+    fail "Apple accepted it, but macOS can't confirm the notarization yet. Try again in a minute."
+fi
+
+mkdir -p -- dist
+mv -f -- build/nospeaker-staging.zip dist/nospeaker.zip
 shasum -a 256 dist/nospeaker.zip > dist/nospeaker.zip.sha256
 chmod 0644 dist/nospeaker.zip dist/nospeaker.zip.sha256
 echo "released: dist/nospeaker.zip (+ .sha256), signed and notarized. Attach them to the GitHub release."
