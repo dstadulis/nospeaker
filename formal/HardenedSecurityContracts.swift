@@ -508,3 +508,117 @@ public struct SafeTouchContact: Sendable, Equatable {
         return best
     }
 }
+
+// MARK: - 6. EINTR-Resilient Terminal Writer, Monotonic Lifecycle & Rate-Limited Browser Open
+
+/// Full-buffer POSIX writer enforcing Lean `hardenedWriteLoop_byte_conservation` (Z3 `T11.Prove`).
+/// Retries transparently on `EINTR` / `EAGAIN` so multi-byte ANSI CSI/OSC sequences never tear.
+public enum EINTRSafeTerminalWriter {
+    public static func writeAll(fd: Int32, utf8Bytes: [UInt8], maxTransientRetries: Int = 256) -> Bool {
+        guard fd >= 0 else { return false }
+        let total = utf8Bytes.count
+        if total == 0 { return true }
+        return utf8Bytes.withUnsafeBytes { rawBuf in
+            guard let base = rawBuf.baseAddress else { return false }
+            var offset = 0
+            var retries = 0
+            while offset < total {
+                let written = Darwin.write(fd, base.advanced(by: offset), total - offset)
+                if written > 0 {
+                    offset += written
+                    retries = 0
+                } else if written < 0 && (errno == EINTR || errno == EAGAIN) {
+                    retries += 1
+                    if retries > maxTransientRetries { return false }
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+}
+
+/// Monotonic 3-state lifecycle lattice (`Running -> Credits -> Stopped`) enforcing
+/// Lean `runPhaseTrace_monotonic` and `two_sigints_guarantee_stopped` (Z3 `T12.Prove`).
+public final class MonotonicLifecycleGate: Sendable {
+    public enum Phase: Int32, Comparable, Sendable {
+        case running = 0
+        case credits = 1
+        case stopped = 2
+
+        public static func < (lhs: Phase, rhs: Phase) -> Bool {
+            lhs.rawValue < rhs.rawValue
+        }
+    }
+
+    private let phaseLock = HeapUnfairLock<Phase>(.running)
+
+    public init() {}
+
+    public var currentPhase: Phase {
+        phaseLock.withLock { $0 }
+    }
+
+    @discardableResult
+    public func onInterrupt() -> Phase {
+        phaseLock.withLock { p in
+            switch p {
+            case .running: p = .credits
+            case .credits, .stopped: p = .stopped
+            }
+            return p
+        }
+    }
+
+    @discardableResult
+    public func enterCredits() -> Phase {
+        phaseLock.withLock { p in
+            if p == .running { p = .credits }
+            return p
+        }
+    }
+
+    public func forceStop() {
+        phaseLock.withLock { $0 = .stopped }
+    }
+}
+
+/// Cooldown-gated & zombie-reaping `/usr/bin/open` launcher (V-09, Lean `debounced_open_rate_limited`).
+public final class DebouncedURLOpener: Sendable {
+    private struct State {
+        var lastOpenedNanoseconds: UInt64 = 0
+        var hasOpened: Bool = false
+    }
+    private let state = HeapUnfairLock(State())
+    public let cooldownNanoseconds: UInt64
+
+    public init(cooldownSeconds: Double = 2.5) {
+        self.cooldownNanoseconds = UInt64(max(0.1, cooldownSeconds) * 1_000_000_000)
+    }
+
+    public func tryOpen(httpsURL: URL, nowNanoseconds: UInt64) -> Bool {
+        guard httpsURL.scheme == "https" else { return false }
+        let allowed = state.withLock { s -> Bool in
+            if s.hasOpened && nowNanoseconds < s.lastOpenedNanoseconds &+ cooldownNanoseconds {
+                return false
+            }
+            s.hasOpened = true
+            s.lastOpenedNanoseconds = nowNanoseconds
+            return true
+        }
+        guard allowed else { return false }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        proc.arguments = [httpsURL.absoluteString]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        proc.terminationHandler = { _ in }  // Foundation reaps exit status cleanly
+        do {
+            try proc.run()
+            return true
+        } catch {
+            return false
+        }
+    }
+}

@@ -15,6 +15,8 @@
     6. PerformanceComplexity— Prefix-Sum O(W+L) Speedup & Real-Time Deadline Guarantee
     7. SupplyChainGatekeeper— Signature, Notarization, Hash, Archive & Umask Safety (CWE-494/829)
     8. TempFileIsolation    — Exclusive 0700 mkdtemp & lstat Regular-File TOCTOU Guard (CWE-377/59)
+    9. TerminalWriteLoop    — EINTR/EAGAIN-Resilient Full-Buffer Byte Conservation (POSIX I/O)
+   10. SignalLifecycle      — Monotonic Running→Credits→Stopped Lattice & Spawn Rate-Limiting
 
   Zero `sorry`, zero external dependencies, verified directly by Lean 4's kernel.
 -/
@@ -667,6 +669,306 @@ theorem lstat_guard_rejects_symlinks_and_fifos (md : LstatMetadata) (euid : Nat)
 
 end TempFileIsolation
 
+-- ============================================================================
+-- 9. EINTR-SAFE FULL-BUFFER TERMINAL WRITE COMPLETENESS (`writeLoop` CONSERVATION)
+-- ============================================================================
+namespace TerminalWriteLoop
+
+/-- Outcome of a single POSIX `write(fd, ptr + off, rem)` syscall invocation. -/
+inductive WriteSyscallOutcome where
+  | wrote (bytes : Nat)  -- Returned `n > 0` (`min n rem` bytes accepted by kernel)
+  | eintr                -- Returned `-1` with `errno == EINTR` (interrupted by signal)
+  | eagain               -- Returned `-1` with `errno == EAGAIN` / `EWOULDBLOCK`
+  | fatalErr             -- Returned `-1` with unrecoverable `errno` (`EBADF` / `EPIPE`)
+  deriving DecidableEq, Repr
+
+/-- Unhardened `out(_:)` loop (`nospeaker.swift@e02a121#L801-L806`):
+    `let n = write(...); if n <= 0 { break }; off += n`
+    Breaks immediately on `EINTR` (`n == -1`), dropping the remaining ANSI frame suffix! -/
+def unhardenedWriteLoop : List Nat → List WriteSyscallOutcome → List Nat
+  | [], _ => []
+  | _ :: _, [] => []
+  | rem, .wrote n :: evs =>
+    if n = 0 then []
+    else
+      let k := min n rem.length
+      rem.take k ++ unhardenedWriteLoop (rem.drop k) evs
+  | _ :: _, .eintr :: _ => []
+  | _ :: _, .eagain :: _ => []
+  | _ :: _, .fatalErr :: _ => []
+
+/-- Hardened `EINTR`/`EAGAIN`-resilient `writeLoop`:
+    retries at the identical byte offset on transient signal/pipe interruptions,
+    advancing strictly by `k = min n rem.length` on positive writes until `rem = []`. -/
+def hardenedWriteLoop : List Nat → List WriteSyscallOutcome → Option (List Nat)
+  | [], _ => some []
+  | _ :: _, [] => none
+  | rem, .wrote n :: evs =>
+    if n = 0 then none
+    else
+      let k := min n rem.length
+      match hardenedWriteLoop (rem.drop k) evs with
+      | some tail => some (rem.take k ++ tail)
+      | none      => none
+  | rem, .eintr :: evs => hardenedWriteLoop rem evs
+  | rem, .eagain :: evs => hardenedWriteLoop rem evs
+  | _ :: _, .fatalErr :: _ => none
+
+/-- Self-contained list partition identity: `xs.take k ++ xs.drop k = xs`. -/
+theorem take_append_drop : ∀ (k : Nat) (xs : List α), xs.take k ++ xs.drop k = xs
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, x :: xs => by
+    simp [List.take, List.drop, take_append_drop k xs]
+
+/-- REFUTATION 9.1 (ANSI Frame Truncation on `EINTR` in Unhardened `out()`):
+    For CSI sequence `\x1b[38m` (`[0x1B, 0x5B, 0x33, 0x38, 0x6D]`), a signal arriving
+    after 2 bytes causes `unhardenedWriteLoop` to abort with bare `\x1b[`, corrupting TTY state,
+    whereas `hardenedWriteLoop` emits the exact 5-byte sequence. -/
+theorem unhardened_out_truncates_ansi_on_eintr :
+    let frame := [0x1B, 0x5B, 0x33, 0x38, 0x6D]
+    let schedule := [WriteSyscallOutcome.wrote 2, .eintr, .wrote 3]
+    (unhardenedWriteLoop frame schedule).length < frame.length ∧
+    hardenedWriteLoop frame schedule = some frame := by
+  decide
+
+/-- PROOF 9.2 (Universal `writeLoop` Byte Conservation):
+    Across ALL byte buffers `buf` and ALL arbitrary schedules `evs` of partial POSIX writes
+    and `EINTR`/`EAGAIN` interruptions, whenever `hardenedWriteLoop` reports completion
+    (`some emitted`), `emitted` is byte-for-byte identical to `buf` (zero drops, zero duplications). -/
+theorem hardenedWriteLoop_byte_conservation :
+    ∀ (evs : List WriteSyscallOutcome) (buf emitted : List Nat),
+      hardenedWriteLoop buf evs = some emitted → emitted = buf
+  | [], [], emitted, h => by
+    simp [hardenedWriteLoop] at h
+    exact h
+  | [], _ :: _, _, h => by
+    simp [hardenedWriteLoop] at h
+  | ev :: _, [], emitted, h => by
+    cases ev <;> simp [hardenedWriteLoop] at h <;> exact h
+  | .eintr :: rest, b :: bs, emitted, h => by
+    simp only [hardenedWriteLoop] at h
+    exact hardenedWriteLoop_byte_conservation rest (b :: bs) emitted h
+  | .eagain :: rest, b :: bs, emitted, h => by
+    simp only [hardenedWriteLoop] at h
+    exact hardenedWriteLoop_byte_conservation rest (b :: bs) emitted h
+  | .fatalErr :: _, _ :: _, _, h => by
+    simp [hardenedWriteLoop] at h
+  | .wrote n :: rest, b :: bs, emitted, h => by
+    simp only [hardenedWriteLoop, List.length_cons] at h
+    by_cases hn : n = 0
+    · simp [hn] at h
+    · simp only [hn, ↓reduceIte] at h
+      cases hrec : hardenedWriteLoop ((b :: bs).drop (min n (bs.length + 1))) rest with
+      | none => rw [hrec] at h; contradiction
+      | some tail =>
+        rw [hrec] at h
+        injection h with hEq
+        have ih := hardenedWriteLoop_byte_conservation rest ((b :: bs).drop (min n (bs.length + 1))) tail hrec
+        rw [← hEq, ih]
+        exact take_append_drop (min n (bs.length + 1)) (b :: bs)
+
+/-- Helper: `xs.drop xs.length = []`. -/
+theorem drop_length_self : ∀ (xs : List α), xs.drop xs.length = []
+  | [] => rfl
+  | _ :: xs => by simp [drop_length_self xs]
+
+/-- Helper: `xs.take xs.length = xs`. -/
+theorem take_length_self : ∀ (xs : List α), xs.take xs.length = xs
+  | [] => rfl
+  | _ :: xs => by simp [take_length_self xs]
+
+/-- PROOF 9.3 (`writeLoop` Liveness Under Arbitrary Finite `EINTR` Bursts):
+    For ANY non-empty buffer `buf` and ANY finite burst of `m` consecutive `EINTR` signals
+    followed by kernel readiness, `hardenedWriteLoop` completes and emits `some buf`. -/
+theorem hardenedWriteLoop_survives_arbitrary_eintr :
+    ∀ (m : Nat) (buf : List Nat),
+      buf ≠ [] →
+      hardenedWriteLoop buf (List.replicate m .eintr ++ [.wrote buf.length]) = some buf
+  | 0, [], hne => absurd rfl hne
+  | 0, b :: bs, _ => by
+    simp only [List.replicate, List.nil_append, hardenedWriteLoop, List.length_cons]
+    have hnz : bs.length + 1 ≠ 0 := by omega
+    have hmin : min (bs.length + 1) (bs.length + 1) = (b :: bs).length := by simp
+    simp only [hnz, ↓reduceIte]
+    rw [hmin, drop_length_self (b :: bs)]
+    simp [hardenedWriteLoop]
+  | m + 1, b :: bs, hne => by
+    simp only [List.replicate_succ, List.cons_append, hardenedWriteLoop]
+    exact hardenedWriteLoop_survives_arbitrary_eintr m (b :: bs) hne
+
+end TerminalWriteLoop
+
+-- ============================================================================
+-- 10. SIGNAL/ATOMIC LIFECYCLE MONOTONICITY (`Running → Credits → Stopped`) & SPAWN RATE-LIMITING
+-- ============================================================================
+namespace SignalLifecycle
+
+/-- Unhardened non-atomic split-boolean run state (`nospeaker.swift@e02a121#L28-L35`, `#L1478-L1479`). -/
+structure UnhardenedSplitState where
+  jumpToCredits : Bool
+  inCredits     : Bool
+  stopRequested : Bool
+  deriving DecidableEq, Repr
+
+def initUnhardenedSplit : UnhardenedSplitState :=
+  { jumpToCredits := false, inCredits := false, stopRequested := false }
+
+def unhardenedRequestEnd (s : UnhardenedSplitState) : UnhardenedSplitState :=
+  if s.inCredits || s.jumpToCredits then { s with stopRequested := true }
+  else { s with jumpToCredits := true }
+
+/-- Non-atomic two-step transition at `nospeaker.swift@e02a121#L1478-L1479`:
+    Step A clears `jumpToCredits = false`; Step B sets `inCredits = true`. -/
+def unhardenedOutroStepA (s : UnhardenedSplitState) : UnhardenedSplitState :=
+  { s with jumpToCredits := false }
+
+def unhardenedOutroStepB (s : UnhardenedSplitState) : UnhardenedSplitState :=
+  { s with inCredits := true }
+
+/-- REFUTATION 10.1 (Split-Boolean Signal Race Drops Second `SIGINT`):
+    If `SIGINT #1` triggers `jumpToCredits`, and `SIGINT #2` arrives asynchronously between
+    `jumpToCredits = false` (L1478) and `inCredits = true` (L1479), `stopRequested` stays `false`
+    even after TWO `Ctrl-C` interrupts! -/
+theorem unhardened_split_flags_drop_second_sigint :
+    let s1 := unhardenedRequestEnd initUnhardenedSplit  -- SIGINT #1
+    let s2 := unhardenedOutroStepA s1                   -- Main thread L1478: jumpToCredits = false
+    let s3 := unhardenedRequestEnd s2                   -- SIGINT #2 arrives before L1479!
+    let s4 := unhardenedOutroStepB s3                   -- Main thread L1479: inCredits = true
+    s4.stopRequested = false := by
+  rfl
+
+/-- Hardened single-word atomic monotonic lifecycle lattice (`0 = Running, 1 = Credits, 2 = Stopped`). -/
+inductive RunPhase where
+  | running
+  | credits
+  | stopped
+  deriving DecidableEq, Repr
+
+def phaseRank : RunPhase → Nat
+  | .running => 0
+  | .credits => 1
+  | .stopped => 2
+
+inductive LifecycleEvent where
+  | sigInt        -- Ctrl-C / `q` / `ESC`: monotonic +1 step (`Running -> Credits -> Stopped`)
+  | enterCredits  -- Main thread enters Outro: monotonic join `max(phase, Credits)`
+  | sigTerm       -- SIGTERM: immediate transition to `Stopped`
+  deriving DecidableEq, Repr
+
+def stepPhase (p : RunPhase) (ev : LifecycleEvent) : RunPhase :=
+  match ev, p with
+  | .sigInt, .running       => .credits
+  | .sigInt, .credits       => .stopped
+  | .sigInt, .stopped       => .stopped
+  | .enterCredits, .running => .credits
+  | .enterCredits, .credits => .credits
+  | .enterCredits, .stopped => .stopped
+  | .sigTerm, _             => .stopped
+
+def runPhaseTrace : RunPhase → List LifecycleEvent → RunPhase
+  | p, []         => p
+  | p, ev :: rest => runPhaseTrace (stepPhase p ev) rest
+
+def countSigInts : List LifecycleEvent → Nat
+  | []              => 0
+  | .sigInt :: rest => 1 + countSigInts rest
+  | _ :: rest       => countSigInts rest
+
+/-- PROOF 10.2 (Single-Step Monotonicity of `Running → Credits → Stopped`):
+    No signal or thread transition can ever decrease `phaseRank`. -/
+theorem stepPhase_monotonic (p : RunPhase) (ev : LifecycleEvent) :
+    phaseRank p ≤ phaseRank (stepPhase p ev) := by
+  cases p <;> cases ev <;> decide
+
+/-- PROOF 10.3 (Arbitrary-Trace Monotonicity):
+    Across ANY finite interleaving `evs`, `RunPhase` progresses monotonically (`Running → Credits → Stopped`). -/
+theorem runPhaseTrace_monotonic : ∀ (evs : List LifecycleEvent) (p : RunPhase),
+    phaseRank p ≤ phaseRank (runPhaseTrace p evs)
+  | [], _ => Nat.le_refl _
+  | ev :: rest, p =>
+    have hstep := stepPhase_monotonic p ev
+    have htail := runPhaseTrace_monotonic rest (stepPhase p ev)
+    Nat.le_trans hstep htail
+
+/-- PROOF 10.4 (`Stopped` is an Absorbing Terminal State):
+    Once `Stopped` is reached, no subsequent `enterCredits` or signal can revive execution. -/
+theorem stopped_is_absorbing : ∀ (evs : List LifecycleEvent),
+    runPhaseTrace .stopped evs = .stopped
+  | [] => rfl
+  | ev :: rest => by
+    have hs : stepPhase .stopped ev = .stopped := by cases ev <;> rfl
+    rw [runPhaseTrace, hs]
+    exact stopped_is_absorbing rest
+
+theorem phaseRank_le_two (p : RunPhase) : phaseRank p ≤ 2 := by
+  cases p <;> decide
+
+theorem sigint_rank_progress : ∀ (evs : List LifecycleEvent) (p : RunPhase),
+    min 2 (phaseRank p + countSigInts evs) ≤ phaseRank (runPhaseTrace p evs)
+  | [], p => by
+    have hp := phaseRank_le_two p
+    simp [countSigInts, runPhaseTrace]
+    omega
+  | .sigInt :: rest, p => by
+    have hstep : phaseRank (stepPhase p .sigInt) = min 2 (phaseRank p + 1) := by
+      cases p <;> decide
+    have ih := sigint_rank_progress rest (stepPhase p .sigInt)
+    simp only [countSigInts, runPhaseTrace]
+    rw [hstep] at ih
+    omega
+  | .enterCredits :: rest, p => by
+    have hm := stepPhase_monotonic p .enterCredits
+    have ih := sigint_rank_progress rest (stepPhase p .enterCredits)
+    simp only [countSigInts, runPhaseTrace]
+    omega
+  | .sigTerm :: rest, p => by
+    have hm := stepPhase_monotonic p .sigTerm
+    have ih := sigint_rank_progress rest (stepPhase p .sigTerm)
+    simp only [countSigInts, runPhaseTrace]
+    omega
+
+/-- PROOF 10.5 (Two `SIGINT`s Deterministically Guarantee `Stopped` Under ALL Interleavings):
+    Eliminates the split-boolean race: ANY execution trace containing `≥ 2` `SIGINT` events
+    (regardless of interleaved `enterCredits` transitions) ends in `.stopped`. -/
+theorem two_sigints_guarantee_stopped (evs : List LifecycleEvent) (p : RunPhase)
+    (h2 : 2 ≤ countSigInts evs) :
+    runPhaseTrace p evs = .stopped := by
+  have hprog := sigint_rank_progress evs p
+  have hge2 : 2 ≤ phaseRank (runPhaseTrace p evs) := by omega
+  cases hfin : runPhaseTrace p evs <;> simp [hfin, phaseRank] at hge2
+  rfl
+
+/-- Debounced `/usr/bin/open` rate-limiter (`V-09`, `nospeaker.swift@e02a121#L1400-L1407`). -/
+def trySpawnOpen (cooldownMs : Nat) (lastSpawnMs : Option Nat) (nowMs : Nat) : Bool × Option Nat :=
+  match lastSpawnMs with
+  | none => (true, some nowMs)
+  | some prev =>
+    if prev + cooldownMs ≤ nowMs then (true, some nowMs)
+    else (false, some prev)
+
+def countAcceptedSpawns (cooldownMs : Nat) : Option Nat → List Nat → Nat
+  | _, [] => 0
+  | last, t :: ts =>
+    let (ok, nextLast) := trySpawnOpen cooldownMs last t
+    (if ok then 1 else 0) + countAcceptedSpawns cooldownMs nextLast ts
+
+/-- REFUTATION 10.6 & PROOF 10.7 (Debounced Browser Spawn Bounds):
+    Key-repeat burst `[100, 130, 160]` (`30ms` apart) spawns `3` processes when `cooldown = 0`
+    (unhardened), vs `1` process under `cooldown = 2500ms`; and every subsequent accepted spawn
+    is separated by at least `cooldownMs`. -/
+theorem debounced_open_rate_limited (cooldownMs prev nowMs : Nat) :
+    countAcceptedSpawns 0 none [100, 130, 160] = 3 ∧
+    countAcceptedSpawns 2500 none [100, 130, 160] = 1 ∧
+    ((trySpawnOpen cooldownMs (some prev) nowMs).1 = true → prev + cooldownMs ≤ nowMs) := by
+  refine ⟨by decide, by decide, ?_⟩
+  simp only [trySpawnOpen]
+  split
+  · intro _; assumption
+  · intro h; contradiction
+
+end SignalLifecycle
+
 end NoSpeakerFormal
 
 -- Kernel Axiom Audit: Verify zero `sorryAx` and zero custom axioms on core theorems!
@@ -686,3 +988,9 @@ end NoSpeakerFormal
 #print axioms NoSpeakerFormal.SupplyChainGatekeeper.umask_077_clears_group_and_world
 #print axioms NoSpeakerFormal.TempFileIsolation.mkdtemp_0700_blocks_foreign_actors
 #print axioms NoSpeakerFormal.TempFileIsolation.lstat_guard_rejects_symlinks_and_fifos
+#print axioms NoSpeakerFormal.TerminalWriteLoop.hardenedWriteLoop_byte_conservation
+#print axioms NoSpeakerFormal.TerminalWriteLoop.hardenedWriteLoop_survives_arbitrary_eintr
+#print axioms NoSpeakerFormal.SignalLifecycle.runPhaseTrace_monotonic
+#print axioms NoSpeakerFormal.SignalLifecycle.stopped_is_absorbing
+#print axioms NoSpeakerFormal.SignalLifecycle.two_sigints_guarantee_stopped
+#print axioms NoSpeakerFormal.SignalLifecycle.debounced_open_rate_limited

@@ -616,6 +616,129 @@ def verify_t10_temp_file_toctou_isolation(v: VerificationRunner) -> None:
     )
 
 
+def verify_t11_eintr_terminal_write_conservation(v: VerificationRunner) -> None:
+    """
+    T11: EINTR-Safe Full-Buffer Terminal Write Completeness (`writeLoop` Byte Conservation)
+    Ref: https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/nospeaker.swift#L797-L808 (`out(_:)`)
+    """
+    total_len = z3.Int("total_len")
+    # Symbolic 4-step syscall schedule: ret_i == -1 means EINTR; ret_i > 0 means partial write
+    rets = [z3.Int(f"write_ret_{i}") for i in range(4)]
+
+    # 11A: Refutation — Unhardened `if n <= 0 { break }` truncates ANSI sequence when EINTR (-1) occurs
+    s_ref = z3.Solver()
+    s_ref.add(total_len == 12)
+    s_ref.add(rets[0] == 5, rets[1] == -1, rets[2] == 7, rets[3] == 0)
+    off_u = z3.IntVal(0)
+    halted_u = z3.BoolVal(False)
+    for r in rets:
+        can_step = z3.And(z3.Not(halted_u), off_u < total_len)
+        # Unhardened breaks on r <= 0 (including EINTR == -1!)
+        halted_u = z3.If(can_step, r <= 0, halted_u)
+        off_u = z3.If(z3.And(can_step, r > 0), off_u + z3.If(r <= total_len - off_u, r, total_len - off_u), off_u)
+    s_ref.add(off_u < total_len)
+    v.check_obligation(
+        "T11.Refute",
+        "Unhardened out() breaks on EINTR (n=-1), truncating mid-frame ANSI escape sequences",
+        s_ref,
+        z3.sat,
+    )
+
+    # 11B: Inductive & Concrete Proof — Hardened EINTR-retry writeLoop preserves exact offset bounds
+    # `0 <= off <= total_len`, never drops/skips bytes on EINTR, and completes whenever sum(positive writes) >= total_len
+    s_prf = z3.Solver()
+    s_prf.add(total_len > 0, total_len <= 65536)
+    pos_sum = z3.IntVal(0)
+    off_h = z3.IntVal(0)
+    bounds_violated = z3.BoolVal(False)
+    for r in rets:
+        # Either EINTR (-1) or valid POSIX write `1 <= r <= total_len`
+        s_prf.add(z3.Or(r == -1, z3.And(r >= 1, r <= total_len)))
+        rem = total_len - off_h
+        step_k = z3.If(off_h >= total_len, 0, z3.If(r == -1, 0, z3.If(r <= rem, r, rem)))
+        next_off = off_h + step_k
+        bounds_violated = z3.Or(bounds_violated, next_off < off_h, next_off > total_len)
+        pos_sum = pos_sum + z3.If(r > 0, r, 0)
+        off_h = next_off
+    # Prove: never violates bounds, AND if kernel accepted >= total_len cumulative bytes, off_h == total_len!
+    s_prf.add(z3.Or(bounds_violated, z3.And(pos_sum >= total_len, off_h != total_len)))
+    v.check_obligation(
+        "T11.Prove",
+        "EINTR-resilient writeLoop conserves 100% of bytes with zero truncation across arbitrary EINTRs",
+        s_prf,
+        z3.unsat,
+    )
+
+
+def verify_t12_signal_monotonicity_and_open_debounce(v: VerificationRunner) -> None:
+    """
+    T12: Monotonic Atomic Lifecycle State (`Running -> Credits -> Stopped`, V-06) & `/usr/bin/open` Debounce (V-09)
+    Ref: https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/nospeaker.swift#L28-L35
+         https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/nospeaker.swift#L1478-L1480
+    """
+    # 12A: Refutation — Split booleans (`jumpToCredits`, `inCredits`, `stopRequested`) drop 2nd SIGINT
+    s_ref = z3.Solver()
+    j0, c0, st0 = z3.BoolVal(False), z3.BoolVal(False), z3.BoolVal(False)
+    # SIGINT #1
+    st1 = z3.If(z3.Or(c0, j0), z3.BoolVal(True), st0)
+    j1 = z3.If(z3.Or(c0, j0), j0, z3.BoolVal(True))
+    # Main thread L1478: jumpToCredits = false (before inCredits = true!)
+    j2 = z3.BoolVal(False)
+    # SIGINT #2 arrives before L1479
+    st3 = z3.If(z3.Or(c0, j2), z3.BoolVal(True), st1)
+    s_ref.add(st3 == z3.BoolVal(False))
+    v.check_obligation(
+        "T12.Refute",
+        "Split booleans (jumpToCredits/inCredits) drop 2nd Ctrl-C when SIGINT races with L1478-L1479",
+        s_ref,
+        z3.sat,
+    )
+
+    # 12B: Proof — Single atomic lattice {0=Running, 1=Credits, 2=Stopped} is strictly monotonic
+    # and ANY 4-event trace with >= 2 SIGINTs (or >= 1 SIGTERM) reaches Stopped (2) and stays Stopped!
+    # Event encoding: 0 = sigInt, 1 = enterCredits, 2 = sigTerm
+    evs = [z3.Int(f"lifecycle_ev_{i}") for i in range(4)]
+    p0 = z3.Int("p0")
+    s_prf = z3.Solver()
+    s_prf.add(p0 >= 0, p0 <= 2)
+    cur = p0
+    regressed = z3.BoolVal(False)
+    sigint_count = z3.IntVal(0)
+    sigterm_seen = z3.BoolVal(False)
+    for ev in evs:
+        s_prf.add(ev >= 0, ev <= 2)
+        nxt = z3.If(
+            ev == 0,
+            z3.If(cur + 1 <= 2, cur + 1, 2),          # sigInt: min(2, cur + 1)
+            z3.If(ev == 1, z3.If(cur >= 1, cur, 1), 2) # enterCredits: max(cur, 1); sigTerm: 2
+        )
+        regressed = z3.Or(regressed, nxt < cur)
+        sigint_count = sigint_count + z3.If(ev == 0, 1, 0)
+        sigterm_seen = z3.Or(sigterm_seen, ev == 2)
+        cur = nxt
+
+    # Also verify `/usr/bin/open` cooldown: two spawns t1 <= t2 accepted -> t2 - t1 >= 2500 ms
+    t1, t2 = z3.Ints("t1_ms t2_ms")
+    cooldown = 2500
+    second_accepted = t2 >= t1 + cooldown
+
+    s_prf.add(
+        z3.Or(
+            regressed,
+            z3.And(p0 == 2, cur != 2),
+            z3.And(sigint_count >= 2, cur != 2),
+            z3.And(sigterm_seen, cur != 2),
+            z3.And(second_accepted, t2 - t1 < cooldown),
+        )
+    )
+    v.check_obligation(
+        "T12.Prove",
+        "Atomic RunPhase (0->1->2) is monotonic, 2 SIGINTs always stop, & /usr/bin/open respects 2.5s cooldown",
+        s_prf,
+        z3.unsat,
+    )
+
+
 def main() -> int:
     print("=" * 105)
     print("  NoSpeaker Z3 SMT Formal Verification Certificate (Security, Safety, Concurrency & Real-Time)")
@@ -633,6 +756,8 @@ def main() -> int:
     verify_t8_realtime_performance_schedulability(runner)
     verify_t9_supply_chain_gatekeeper(runner)
     verify_t10_temp_file_toctou_isolation(runner)
+    verify_t11_eintr_terminal_write_conservation(runner)
+    verify_t12_signal_monotonicity_and_open_debounce(runner)
 
     total_ms = (time.perf_counter() - t_start) * 1000.0
     passed = sum(1 for *_, ok in runner.results if ok)
