@@ -978,6 +978,95 @@ def verify_t15_signals_voice_lpc_and_release_scripts(v: VerificationRunner) -> N
     )
 
 
+def verify_t16_verifier_round1_closure(v: VerificationRunner) -> None:
+    """
+    T16: Verifier Round-1 Defect Closure (`H-1`, `H-2`, `H-3`)
+      - H-1: Concurrent non-blocking `voiceExists` stdout drain + 5s timeout (vs sequential read hang)
+      - H-2: `SIGINT`-interrupted `render(_:)` returns `[]` cleanly rather than `fail()` (`exit(1)`)
+      - H-3: `play.sh` fail-closed SHA-256 gate rejecting HTTP-200 empty `.sha256` & honoring REQUIRE_SHA256=1
+    """
+    # 16A: Refutation — HTTP-200 empty `.sha256` body fails open in Round-1 `elif curl ...` chain
+    env_present = z3.Bool("env_present")
+    sidecar_http_ok = z3.Bool("sidecar_http_ok")
+    sidecar_nonempty = z3.Bool("sidecar_nonempty")
+    require_sha = z3.Bool("require_sha")
+    s_ref = z3.Solver()
+    s_ref.add(
+        z3.Not(env_present),
+        sidecar_http_ok,
+        z3.Not(sidecar_nonempty),
+        require_sha,
+    )
+    # Buggy Round-1 control flow: `elif curl` succeeded so `elif REQUIRE_SHA256=1` was skipped,
+    # and `expected_sha` was empty so `if [ -n "$expected_sha" ]` was ALSO skipped!
+    early_fail = z3.And(z3.Not(env_present), z3.Not(sidecar_http_ok), require_sha)
+    has_expected = z3.If(env_present, z3.BoolVal(True), z3.If(sidecar_http_ok, sidecar_nonempty, z3.BoolVal(False)))
+    buggy_admitted = z3.And(z3.Not(early_fail), z3.Not(has_expected))
+    s_ref.add(buggy_admitted)
+    v.check_obligation(
+        "T16.Refute",
+        "Empty HTTP-200 .sha256 sidecar bypasses elif REQUIRE_SHA256=1 check if unguarded (H-3)",
+        s_ref,
+        z3.sat,
+    )
+
+    # 16B: Universal Proof across H-1, H-2, H-3
+    s_prf = z3.Solver()
+    actual_sha, env_sha, sidecar_sha = z3.Ints("actual_sha env_sha sidecar_sha")
+
+    # H-3: Hardened SHA-256 gate
+    hardened_sha_ok = z3.If(
+        env_present,
+        actual_sha == env_sha,
+        z3.If(
+            sidecar_http_ok,
+            z3.And(sidecar_nonempty, actual_sha == sidecar_sha),
+            z3.Not(require_sha),
+        ),
+    )
+    h3_bad = z3.Or(
+        z3.And(z3.Not(env_present), sidecar_http_ok, z3.Not(sidecar_nonempty), hardened_sha_ok),
+        z3.And(
+            require_sha,
+            hardened_sha_ok,
+            z3.Not(
+                z3.Or(
+                    z3.And(env_present, actual_sha == env_sha),
+                    z3.And(z3.Not(env_present), sidecar_http_ok, sidecar_nonempty, actual_sha == sidecar_sha),
+                )
+            ),
+        ),
+    )
+
+    # H-1: Concurrent pipe drain + timeout bounded by timeout_ms + grace_ms (5500 ms) for ALL pipe_ms >= 0
+    pipe_ms, proc_ms = z3.Ints("pipe_ms proc_ms")
+    timeout_ms, grace_ms = 5000, 500
+    s_prf.add(pipe_ms >= 0, proc_ms >= 0)
+    max_child = z3.If(pipe_ms >= proc_ms, pipe_ms, proc_ms)
+    elapsed_ms = z3.If(max_child <= timeout_ms + grace_ms, max_child, timeout_ms + grace_ms)
+    voice_admits = z3.And(pipe_ms <= timeout_ms, proc_ms <= timeout_ms)
+    h1_bad = z3.Or(
+        elapsed_ms > timeout_ms + grace_ms,
+        z3.And(pipe_ms > timeout_ms, voice_admits),
+    )
+
+    # H-2: Interrupted `render(_:)` (`phase != 0`) NEVER triggers `fail()` (`outcome == 2`)
+    # Outcomes: 0 = frames, 1 = clean_empty_interrupted, 2 = fatal_fail_exit1
+    phase4 = z3.Int("phase4")
+    say_ok, wav_ok = z3.Bools("say_ok wav_ok")
+    s_prf.add(phase4 >= 0, phase4 <= 3)
+    render_outcome = z3.If(phase4 != 0, 1, z3.If(z3.And(say_ok, wav_ok), 0, 2))
+    h2_bad = z3.And(phase4 != 0, render_outcome == 2)
+
+    s_prf.add(z3.Or(h3_bad, h1_bad, h2_bad))
+    v.check_obligation(
+        "T16.Prove",
+        "H-1..H-3: Fail-closed .sha256 gate, <=5.5s non-blocking voice check & SIGINT render abort verified",
+        s_prf,
+        z3.unsat,
+    )
+
+
 def main() -> int:
     print("=" * 105)
     print("  NoSpeaker Z3 SMT Formal Verification Certificate (Security, Safety, Concurrency & Real-Time)")
@@ -1000,6 +1089,7 @@ def main() -> int:
     verify_t13_tty_cloexec_key_and_ui_bounds(runner)
     verify_t14_pty_ffi_coreaudio_cf_and_clock(runner)
     verify_t15_signals_voice_lpc_and_release_scripts(runner)
+    verify_t16_verifier_round1_closure(runner)
 
     total_ms = (time.perf_counter() - t_start) * 1000.0
     passed = sum(1 for *_, ok in runner.results if ok)

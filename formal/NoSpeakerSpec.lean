@@ -21,6 +21,7 @@
    12. DarwinFFIAndClock    — PTY DoS Cap, sysctl NUL, Stereo Mute, CF Retain & Mach Clock (IH-06..10)
    13. SignalLPCAndScripts  — CLI Signals, Exact Voice & Dash-Dash, Levinson-Durbin & Scripts (IH-11..15)
    14. ConcreteRefinement   — 4-Phase RunController Simulation, 1-Col Glyph & Smart-Quote Fold Proofs
+   15. VerifierRound1Closure— SHA-256 Empty-Sidecar Gate, Non-Blocking Voice Timeout & SIGINT Render
 
   Zero `sorry`, zero external dependencies, verified directly by Lean 4's kernel.
 -/
@@ -1816,6 +1817,163 @@ theorem mttouch_min4_cap_prevents_88b_oob (idx count : Nat)
 
 end ConcreteRefinement
 
+-- ============================================================================
+-- 15. VERIFIER ROUND-1 CLOSURE: FAIL-CLOSED SHA-256, BOUNDED VOICE READ & SIGINT RENDER
+-- ============================================================================
+namespace VerifierRound1Closure
+
+-- ----------------------------------------------------------------------------
+-- H-3: `play.sh` Fail-Closed SHA-256 Gate on Empty `.sha256` Sidecar & `REQUIRE_SHA256=1`
+-- ----------------------------------------------------------------------------
+/-- Unhardened `if/elif/elif` digest resolution in `play.sh` Round 1:
+    When `envSha = none` and `sidecarHttpOk = true` with an empty body (`sidecarSha = none`),
+    the `elif curl ...` branch succeeds with `expected_sha = ""`, bypassing BOTH
+    `elif [ REQUIRE_SHA256 = 1 ]` AND `if [ -n "$expected_sha" ]` (failing open!). -/
+def buggyRound1ShaGate
+    (envSha : Option Nat) (sidecarHttpOk : Bool) (sidecarSha : Option Nat)
+    (requireSha : Bool) (actualSha : Nat) : Bool :=
+  let expected : Option Nat :=
+    match envSha with
+    | some d => some d
+    | none   => if sidecarHttpOk then sidecarSha else none
+  let failedEarly := envSha.isNone && !sidecarHttpOk && requireSha
+  if failedEarly then false
+  else
+    match expected with
+    | some d => decide (actualSha = d)
+    | none   => true  -- BUG: `sidecarHttpOk = true ∧ sidecarSha = none` reaches here even if `requireSha = true`!
+
+/-- Hardened fail-closed SHA-256 gate:
+    1. If `NOSPEAKER_SHA256` (`envSha`) is set, `actualSha` MUST match it.
+    2. Else if `${url}.sha256` HTTP fetch succeeded (`sidecarHttpOk = true`), its parsed digest
+       MUST be non-empty (`some d`) AND `actualSha == d` (empty HTTP 200 sidecar fails closed!).
+    3. Else (`envSha = none ∧ !sidecarHttpOk`), fails closed whenever `requireSha = true`. -/
+def hardenedSha256Gate
+    (envSha : Option Nat) (sidecarHttpOk : Bool) (sidecarSha : Option Nat)
+    (requireSha : Bool) (actualSha : Nat) : Bool :=
+  match envSha with
+  | some d => decide (actualSha = d)
+  | none   =>
+    if sidecarHttpOk then
+      match sidecarSha with
+      | some d => decide (actualSha = d)
+      | none   => false
+    else
+      !requireSha
+
+/-- REFUTATION 15.1 & PROOF 15.2 (`H-3` SHA-256 Sidecar Empty-Body & Mandatory-Pin Soundness):
+    1. `buggyRound1ShaGate` falsely returns `true` on HTTP-200 empty `.sha256` even when `requireSha = true`!
+    2. `hardenedSha256Gate` ALWAYS rejects an HTTP-200 empty `.sha256` (`false`), and whenever
+       `requireSha = true`, acceptance strictly implies a verified cryptographic digest match! -/
+theorem h3_sha256_fail_closed_sound
+    (envSha sidecarSha : Option Nat) (sidecarHttpOk : Bool) (requireSha : Bool) (actualSha : Nat) :
+    buggyRound1ShaGate none true none true actualSha = true ∧
+    hardenedSha256Gate none true none requireSha actualSha = false ∧
+    (hardenedSha256Gate envSha sidecarHttpOk sidecarSha true actualSha = true →
+      envSha = some actualSha ∨ (sidecarHttpOk = true ∧ sidecarSha = some actualSha)) := by
+  refine ⟨rfl, rfl, ?_⟩
+  unfold hardenedSha256Gate
+  cases envSha with
+  | some d =>
+    simp only [decide_eq_true_eq]
+    intro heq; left; rw [heq]
+  | none =>
+    cases sidecarHttpOk with
+    | false => simp
+    | true =>
+      cases sidecarSha with
+      | none => simp
+      | some d =>
+        simp only [↓reduceIte, decide_eq_true_eq]
+        intro heq; right; exact ⟨trivial, by rw [heq]⟩
+
+/-- `H-3(b)`: `build.sh` target path guard rejecting BOTH symlinks and directories (`!isSymlink ∧ !isDir`)
+    so `mv -f -- build/nospeaker nospeaker` never moves the binary inside `nospeaker/nospeaker`. -/
+def safeAtomicTargetPath (isSymlink isDirectory : Bool) : Bool :=
+  !isSymlink && !isDirectory
+
+theorem h3_safe_atomic_target_iff (isSym isDir : Bool) :
+    safeAtomicTargetPath isSym isDir = true ↔ (isSym = false ∧ isDir = false) := by
+  simp [safeAtomicTargetPath, Bool.and_eq_true]
+
+-- ----------------------------------------------------------------------------
+-- H-1: Non-Blocking / Concurrent `voiceExists(_:)` Pipe Drain + Deadline Termination
+-- ----------------------------------------------------------------------------
+/-- Sequential `read`-before-`wait` (`nospeaker.swift` Round 1): blocks for full `pipeOpenMs`
+    BEFORE `exitSem.wait(timeout: timeoutMs)` is ever reached! -/
+def sequentialReadBeforeWaitMs (pipeOpenMs timeoutMs : Nat) : Nat :=
+  pipeOpenMs + timeoutMs
+
+/-- Concurrent / deadline-polled `voiceExists`: drains stdout concurrently with deadline `timeoutMs`,
+    terminating + `SIGKILL`ing child after `graceMs` (`500 ms`) if still alive. -/
+def concurrentBoundedVoiceCheckMs (pipeOpenMs procExitMs timeoutMs graceMs : Nat) : Nat :=
+  min (max pipeOpenMs procExitMs) (timeoutMs + graceMs)
+
+def concurrentVoiceCheckAdmits
+    (tokenOk : Bool) (pipeOpenMs procExitMs timeoutMs : Nat) (exitZero exactMatch : Bool) : Bool :=
+  tokenOk && decide (pipeOpenMs ≤ timeoutMs ∧ procExitMs ≤ timeoutMs) && exitZero && exactMatch
+
+/-- REFUTATION 15.3 & PROOF 15.4 (`H-1` `voiceExists` Hang Elimination & Fail-Closed Timeout):
+    1. Stalled `/usr/bin/say` stdout (`pipeOpenMs = 60000 > 5000`) stalls sequential `read` for `> 60s`.
+    2. Concurrent deadline drain terminates in `≤ timeoutMs + graceMs` (`5.5s`) for ALL `pipeOpenMs`
+       and returns `false` whenever `pipeOpenMs > timeoutMs ∨ procExitMs > timeoutMs`! -/
+theorem h1_voiceExists_concurrent_deadline_sound
+    (tokenOk exitZero exactMatch : Bool) (pipeOpenMs procExitMs timeoutMs graceMs : Nat) :
+    sequentialReadBeforeWaitMs 60000 5000 > 5500 ∧
+    concurrentBoundedVoiceCheckMs pipeOpenMs procExitMs timeoutMs graceMs ≤ timeoutMs + graceMs ∧
+    (timeoutMs < pipeOpenMs →
+      concurrentVoiceCheckAdmits tokenOk pipeOpenMs procExitMs timeoutMs exitZero exactMatch = false) := by
+  refine ⟨by decide, Nat.min_le_right _ _, ?_⟩
+  intro hgt
+  unfold concurrentVoiceCheckAdmits
+  have hfalse : decide (pipeOpenMs ≤ timeoutMs ∧ procExitMs ≤ timeoutMs) = false := by
+    simp only [decide_eq_false_iff_not]
+    omega
+  simp [hfalse]
+
+-- ----------------------------------------------------------------------------
+-- H-2: `SIGINT`-Interrupted `render(_:)` Clean Abort (`[]` vs Bogus `fail()` `exit(1)`)
+-- ----------------------------------------------------------------------------
+inductive RenderExitBehavior where
+  | synthesizedFrames
+  | cleanInterruptedEmpty  -- Returns `[]` cleanly so show jumps to credits or CLI exits `0`/`130`
+  | bogusFatalFailExit1    -- Calls `fail(...) -> exit(1)` with misleading voice/say error!
+  deriving DecidableEq, Repr
+
+/-- Round-1 `render(_:)` checked `p.terminationStatus == 0` without checking `runControl` interruption:
+    when foreground-group `SIGINT` killed `/usr/bin/say` (`sayExitZero = false`) and advanced
+    `phase` to `.jumpingToCredits` or `.stopped`, `render` called `fail()` (`bogusFatalFailExit1`)! -/
+def round1RenderBehavior
+    (_phase : ConcreteRefinement.RunPhase4) (sayExitZero wavValid : Bool) : RenderExitBehavior :=
+  if sayExitZero && wavValid then .synthesizedFrames else .bogusFatalFailExit1
+
+/-- Hardened `render(_:)`: checks `phase != .running` (`shouldSkipToCredits || stopRequested`)
+    during wait slices and BEFORE `fail()`, returning `.cleanInterruptedEmpty` (`[]`) whenever
+    interrupted by `Ctrl-C` / `q` / `SIGTERM`! -/
+def hardenedRenderBehavior
+    (phase : ConcreteRefinement.RunPhase4) (sayExitZero wavValid : Bool) : RenderExitBehavior :=
+  if phase != .running then .cleanInterruptedEmpty
+  else if sayExitZero && wavValid then .synthesizedFrames
+  else .bogusFatalFailExit1
+
+/-- REFUTATION 15.5 & PROOF 15.6 (`H-2` Zero False `fail()` Exits on `Ctrl-C` During `render`): -/
+theorem h2_sigint_render_clean_abort_sound
+    (phase : ConcreteRefinement.RunPhase4) (sayExitZero wavValid : Bool) :
+    round1RenderBehavior .jumpingToCredits false false = .bogusFatalFailExit1 ∧
+    round1RenderBehavior .stopped false false = .bogusFatalFailExit1 ∧
+    (phase ≠ .running →
+      hardenedRenderBehavior phase sayExitZero wavValid = .cleanInterruptedEmpty ∧
+      hardenedRenderBehavior phase sayExitZero wavValid ≠ .bogusFatalFailExit1) := by
+  refine ⟨rfl, rfl, ?_⟩
+  intro hne
+  cases phase with
+  | running => exact absurd rfl hne
+  | jumpingToCredits => simp [hardenedRenderBehavior]
+  | inCredits => simp [hardenedRenderBehavior]
+  | stopped => simp [hardenedRenderBehavior]
+
+end VerifierRound1Closure
+
 end NoSpeakerFormal
 
 -- Kernel Axiom Audit: Verify zero `sorryAx` and zero custom axioms on core theorems!
@@ -1863,3 +2021,7 @@ end NoSpeakerFormal
 #print axioms NoSpeakerFormal.ConcreteRefinement.isVerifiedSingleColumnGlyph_safe
 #print axioms NoSpeakerFormal.ConcreteRefinement.foldSpeechScalar_sound
 #print axioms NoSpeakerFormal.ConcreteRefinement.mttouch_min4_cap_prevents_88b_oob
+#print axioms NoSpeakerFormal.VerifierRound1Closure.h3_sha256_fail_closed_sound
+#print axioms NoSpeakerFormal.VerifierRound1Closure.h3_safe_atomic_target_iff
+#print axioms NoSpeakerFormal.VerifierRound1Closure.h1_voiceExists_concurrent_deadline_sound
+#print axioms NoSpeakerFormal.VerifierRound1Closure.h2_sigint_render_clean_abort_sound

@@ -5,7 +5,7 @@
 #   3. Z3Py multi-theory security, thermal & real-time prover (`z3_security_performance_suite.py`)
 #   4. Swift 6 strict-concurrency & capability contract typechecker (`HardenedSecurityContracts.swift`)
 set -eu
-cd "$(dirname "$0")"
+cd -- "$(dirname -- "$0")"
 
 echo "[1/4] Checking Lean 4 formal proofs (NoSpeakerSpec.lean)…"
 lean NoSpeakerSpec.lean
@@ -19,12 +19,22 @@ echo "[3/4] Running Z3Py security, thermal & real-time proof suite (z3_security_
 python3 z3_security_performance_suite.py
 
 echo ""
-echo "[4/4] Typechecking HardenedSecurityContracts.swift (Swift 6 -strict-concurrency=complete)…"
+echo "[4/4] Typechecking HardenedSecurityContracts.swift (Swift 6 -strict-concurrency=complete -warnings-as-errors)…"
 swiftc -module-cache-path /tmp/swift-module-cache \
     -swift-version 6 \
     -strict-concurrency=complete \
+    -warnings-as-errors \
     -O \
-    -target arm64-apple-macos13 \
+    -target arm64-apple-macos12 \
+    -parse-as-library \
+    -typecheck HardenedSecurityContracts.swift
+
+swiftc -module-cache-path /tmp/swift-module-cache \
+    -swift-version 6 \
+    -strict-concurrency=complete \
+    -warnings-as-errors \
+    -O \
+    -target x86_64-apple-macos13 \
     -parse-as-library \
     -typecheck HardenedSecurityContracts.swift
 

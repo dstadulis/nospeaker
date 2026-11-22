@@ -137,6 +137,7 @@ public enum HardenedSpeechSynthesizer {
             throw SynthesisSecurityError.processLaunchFailed
         }
 
+        _ = fcntl(stdinPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         try? stdinPipe.fileHandleForWriting.write(contentsOf: payload)
         try? stdinPipe.fileHandleForWriting.close()
 
@@ -149,10 +150,11 @@ public enum HardenedSpeechSynthesizer {
             throw SynthesisSecurityError.synthesisFailed(proc.terminationStatus)
         }
 
-        // Verify via lstat that wavURL is a regular file owned by effective UID (not a symlink/FIFO).
+        // Verify via lstat that wavURL is a regular single-link file owned by effective UID (not a symlink/FIFO).
         var st = stat()
         guard lstat(wavURL.path, &st) == 0,
               (st.st_mode & S_IFMT) == S_IFREG,
+              st.st_nlink == 1,
               st.st_uid == geteuid() else {
             throw SynthesisSecurityError.outputNotRegularFile
         }
