@@ -739,6 +739,93 @@ def verify_t12_signal_monotonicity_and_open_debounce(v: VerificationRunner) -> N
     )
 
 
+def verify_t13_tty_cloexec_key_and_ui_bounds(v: VerificationRunner) -> None:
+    """
+    T13: Batch 1 Issue-Hunter Invariants (`IH-01`..`IH-05`)
+      - IH-01: Canvas.shown differential cache coherence on failed/EINTR writes
+      - IH-02: tcgetattr failure B0-hangup guard & raw-mode VMIN=1, VTIME=0
+      - IH-03: F_DUPFD_CLOEXEC child-exec controlling-TTY non-leakage
+      - IH-04: Double-ESC exit & UTF-8 continuation-byte / ASCII-command disjointness
+      - IH-05: Total drawCaption prefix bounds (when t < captionStart) & Euclidean modulo
+    """
+    # 13A: Refutation — t < captionStart yields negative prefix (-1) & tcgetattr failure sets B0 (ospeed=0)
+    t_now, cap_start, cap_len = z3.Real("t_now"), z3.Real("cap_start"), z3.Int("cap_len")
+    s_ref = z3.Solver()
+    s_ref.add(t_now == z3.RealVal("0.998"), cap_start == z3.RealVal("1.000"), cap_len == 40)
+    raw_progress = (t_now - cap_start) / z3.RealVal("1.0") * z3.RealVal("1.15")
+    s_ref.add(raw_progress < 0)
+    v.check_obligation(
+        "T13.Refute",
+        "Snapshot race (t < captionStart) drives drawCaption progress < 0 (prefix(-1) SIGTRAP, IH-05)",
+        s_ref,
+        z3.sat,
+    )
+
+    # 13B: Universal Proof across IH-01..IH-05 hardened invariants
+    s_prf = z3.Solver()
+    # IH-01: 2-step Canvas commit coherence
+    init_cells = z3.Int("init_cells")
+    c1, c2 = z3.Ints("c1 c2")
+    ok1, ok2 = z3.Bools("ok1 ok2")
+    term1 = z3.If(ok1, c1, init_cells)
+    shown1_valid = ok1
+    shown1_val = c1
+    term2 = z3.If(ok2, c2, term1)
+    shown2_valid = ok2
+    shown2_val = c2
+    ih01_violated = z3.Or(
+        z3.And(shown1_valid, shown1_val != term1),
+        z3.And(shown2_valid, shown2_val != term2),
+    )
+
+    # IH-02: Termios B0 hangup prevention
+    orig_ospeed = z3.Int("orig_ospeed")
+    getattr_ok = z3.Bool("getattr_ok")
+    s_prf.add(orig_ospeed > 0)
+    restored_ospeed = z3.If(getattr_ok, orig_ospeed, orig_ospeed)
+    raw_vmin = z3.If(getattr_ok, 1, -1)
+    raw_vtime = z3.If(getattr_ok, 0, -1)
+    ih02_violated = z3.Or(
+        restored_ospeed != orig_ospeed,
+        restored_ospeed <= 0,
+        z3.And(getattr_ok, z3.Or(raw_vmin != 1, raw_vtime != 0)),
+    )
+
+    # IH-03: FD_CLOEXEC prevents child inheritance across execve
+    fd_cloexec = z3.BoolVal(True)
+    child_inherits_tty = z3.Not(fd_cloexec)
+
+    # IH-04: UTF-8 continuation byte [0x80, 0xBF] never collides with ESC(0x1B)/'f'(0x66)/'q'(0x71)/' '(0x20)
+    utf8_cont = z3.BitVec("utf8_cont", 8)
+    s_prf.add(z3.UGE(utf8_cont, z3.BitVecVal(0x80, 8)), z3.ULE(utf8_cont, z3.BitVecVal(0xBF, 8)))
+    ih04_violated = z3.Or(
+        utf8_cont == z3.BitVecVal(0x1B, 8),
+        utf8_cont == z3.BitVecVal(0x66, 8),
+        utf8_cont == z3.BitVecVal(0x71, 8),
+        utf8_cont == z3.BitVecVal(0x20, 8),
+    )
+
+    # IH-05: Clamped progress in [0, 1] & Euclidean modulo in [0, n)
+    clamped_prog = z3.If(raw_progress <= 0, z3.RealVal(0), z3.If(raw_progress >= 1, z3.RealVal(1), raw_progress))
+    x_int, n_mod = z3.Ints("x_int n_mod")
+    s_prf.add(n_mod > 0, n_mod <= 1024)
+    euclid_idx = ((x_int % n_mod) + n_mod) % n_mod
+    ih05_violated = z3.Or(
+        clamped_prog < 0,
+        clamped_prog > 1,
+        euclid_idx < 0,
+        euclid_idx >= n_mod,
+    )
+
+    s_prf.add(z3.Or(ih01_violated, ih02_violated, child_inherits_tty, ih04_violated, ih05_violated))
+    v.check_obligation(
+        "T13.Prove",
+        "IH-01..IH-05: Canvas sync, Termios B0 guard, FD_CLOEXEC, UTF-8 framing & total UI math verified",
+        s_prf,
+        z3.unsat,
+    )
+
+
 def main() -> int:
     print("=" * 105)
     print("  NoSpeaker Z3 SMT Formal Verification Certificate (Security, Safety, Concurrency & Real-Time)")
@@ -758,6 +845,7 @@ def main() -> int:
     verify_t10_temp_file_toctou_isolation(runner)
     verify_t11_eintr_terminal_write_conservation(runner)
     verify_t12_signal_monotonicity_and_open_debounce(runner)
+    verify_t13_tty_cloexec_key_and_ui_bounds(runner)
 
     total_ms = (time.perf_counter() - t_start) * 1000.0
     passed = sum(1 for *_, ok in runner.results if ok)

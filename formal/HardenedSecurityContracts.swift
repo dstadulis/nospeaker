@@ -420,10 +420,10 @@ public final class IdempotentFDGuard: Sendable {
     public func silence() {
         state.withLock { d in
             guard d.savedOut < 0 else { return }  // Idempotent guard!
-            let nullFD = open("/dev/null", O_WRONLY)
+            let nullFD = open("/dev/null", O_WRONLY | O_CLOEXEC)
             guard nullFD >= 0 else { return }
-            let dupOut = dup(STDOUT_FILENO)
-            let dupErr = dup(STDERR_FILENO)
+            let dupOut = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0)
+            let dupErr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)
             guard dupOut >= 0, dupErr >= 0 else {
                 if dupOut >= 0 { close(dupOut) }
                 if dupErr >= 0 { close(dupErr) }
@@ -432,8 +432,14 @@ public final class IdempotentFDGuard: Sendable {
             }
             fflush(stdout)
             fflush(stderr)
-            dup2(nullFD, STDOUT_FILENO)
-            dup2(nullFD, STDERR_FILENO)
+            guard dup2(nullFD, STDOUT_FILENO) >= 0, dup2(nullFD, STDERR_FILENO) >= 0 else {
+                _ = dup2(dupOut, STDOUT_FILENO)
+                _ = dup2(dupErr, STDERR_FILENO)
+                close(dupOut)
+                close(dupErr)
+                close(nullFD)
+                return
+            }
             close(nullFD)
             d.savedOut = dupOut
             d.savedErr = dupErr
