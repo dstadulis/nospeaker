@@ -20,6 +20,7 @@
    11. TerminalAndUISafety  — Canvas Sync, Termios B0 Guard, FD_CLOEXEC, Key/UTF-8 & UI Bounds (IH-01..05)
    12. DarwinFFIAndClock    — PTY DoS Cap, sysctl NUL, Stereo Mute, CF Retain & Mach Clock (IH-06..10)
    13. SignalLPCAndScripts  — CLI Signals, Exact Voice & Dash-Dash, Levinson-Durbin & Scripts (IH-11..15)
+   14. ConcreteRefinement   — 4-Phase RunController Simulation, 1-Col Glyph & Smart-Quote Fold Proofs
 
   Zero `sorry`, zero external dependencies, verified directly by Lean 4's kernel.
 -/
@@ -1682,6 +1683,130 @@ theorem ih15_build_sh_strict_mode_and_atomic_dist_iff
 
 end SignalLPCAndScripts
 
+-- ============================================================================
+-- 14. CONCRETE IMPLEMENTATION REFINEMENT & SIMULATION HOMOMORPHISM (`harden/app`)
+-- ============================================================================
+namespace ConcreteRefinement
+
+/-- Concrete 4-state `RunPhase` implemented in hardened `RunController` (`nospeaker.swift`):
+    `running (0) → jumpingToCredits (1) → inCredits (2) → stopped (3)`. -/
+inductive RunPhase4 where
+  | running
+  | jumpingToCredits
+  | inCredits
+  | stopped
+  deriving DecidableEq, Repr
+
+def phaseRank4 : RunPhase4 → Nat
+  | .running          => 0
+  | .jumpingToCredits => 1
+  | .inCredits        => 2
+  | .stopped          => 3
+
+def stepPhase4 (p : RunPhase4) (ev : SignalLifecycle.LifecycleEvent) : RunPhase4 :=
+  match ev, p with
+  | .sigInt, .running                => .jumpingToCredits
+  | .sigInt, .jumpingToCredits       => .stopped
+  | .sigInt, .inCredits              => .stopped
+  | .sigInt, .stopped                => .stopped
+  | .enterCredits, .running          => .inCredits
+  | .enterCredits, .jumpingToCredits => .inCredits
+  | .enterCredits, .inCredits        => .inCredits
+  | .enterCredits, .stopped          => .stopped
+  | .sigTerm, _                      => .stopped
+
+def runPhase4Trace : RunPhase4 → List SignalLifecycle.LifecycleEvent → RunPhase4
+  | p, []         => p
+  | p, ev :: rest => runPhase4Trace (stepPhase4 p ev) rest
+
+/-- Quotient projection mapping concrete `RunPhase4` onto abstract 3-state `RunPhase`. -/
+def project4to3 : RunPhase4 → SignalLifecycle.RunPhase
+  | .running          => .running
+  | .jumpingToCredits => .credits
+  | .inCredits        => .credits
+  | .stopped          => .stopped
+
+/-- PROOF 14.1 (Concrete 4-Phase Monotonicity & Exact Step Simulation Homomorphism):
+    1. Every transition on `RunPhase4` is strictly monotonic (`phaseRank4 p ≤ phaseRank4 p'`).
+    2. `project4to3` commutes with ALL `LifecycleEvent` transitions! -/
+theorem stepPhase4_monotonic_and_simulates (p : RunPhase4) (ev : SignalLifecycle.LifecycleEvent) :
+    phaseRank4 p ≤ phaseRank4 (stepPhase4 p ev) ∧
+    project4to3 (stepPhase4 p ev) = SignalLifecycle.stepPhase (project4to3 p) ev := by
+  constructor
+  · cases p <;> cases ev <;> decide
+  · cases p <;> cases ev <;> rfl
+
+/-- PROOF 14.2 (Arbitrary-Horizon Trace Simulation & 2-`SIGINT` Termination on `RunController`): -/
+theorem runPhase4Trace_simulates :
+    ∀ (evs : List SignalLifecycle.LifecycleEvent) (p : RunPhase4),
+      project4to3 (runPhase4Trace p evs) = SignalLifecycle.runPhaseTrace (project4to3 p) evs
+  | [], _ => rfl
+  | ev :: rest, p => by
+    simp only [runPhase4Trace, SignalLifecycle.runPhaseTrace]
+    have hcomm := (stepPhase4_monotonic_and_simulates p ev).2
+    rw [← hcomm]
+    exact runPhase4Trace_simulates rest (stepPhase4 p ev)
+
+theorem two_sigints_stop_runController (evs : List SignalLifecycle.LifecycleEvent) (p : RunPhase4)
+    (h2 : 2 ≤ SignalLifecycle.countSigInts evs) :
+    runPhase4Trace p evs = .stopped := by
+  have hsim := runPhase4Trace_simulates evs p
+  have habs := SignalLifecycle.two_sigints_guarantee_stopped evs (project4to3 p) h2
+  rw [habs] at hsim
+  cases hfin : runPhase4Trace p evs <;> simp [hfin, project4to3] at hsim
+  rfl
+
+/-- Concrete `isVerifiedSingleColumnGlyph` predicate from hardened `Canvas.put`:
+    printable ASCII (`0x20..0x7E`) plus the exact 13 single-width UI box/quote/symbol scalars. -/
+def isVerifiedSingleColumnGlyph (cp : Nat) : Bool :=
+  decide ((0x20 ≤ cp ∧ cp ≤ 0x7E) ∨
+          cp = 0x00B7 ∨ cp = 0x00BB ∨ cp = 0x201C ∨ cp = 0x201D ∨
+          cp = 0x2500 ∨ cp = 0x2502 ∨ cp = 0x256D ∨ cp = 0x256E ∨
+          cp = 0x256F ∨ cp = 0x2570 ∨ cp = 0x2588 ∨ cp = 0x25B6 ∨ cp = 0x25B8)
+
+/-- PROOF 14.3 (1-Column Glyph Allowlist Excludes All C0/DEL/C1 Escapes, Combining Marks & Bidi): -/
+theorem isVerifiedSingleColumnGlyph_safe (cp : Nat)
+    (h : isVerifiedSingleColumnGlyph cp = true) :
+    0x20 ≤ cp ∧ cp ≠ 0x7F ∧
+    ¬(0x80 ≤ cp ∧ cp ≤ 0x9F) ∧
+    ¬(0x0300 ≤ cp ∧ cp ≤ 0x036F) ∧
+    ¬(0x202A ≤ cp ∧ cp ≤ 0x202E) ∧
+    ¬(0x2066 ≤ cp ∧ cp ≤ 0x2069) := by
+  unfold isVerifiedSingleColumnGlyph at h
+  simp only [decide_eq_true_eq] at h
+  omega
+
+/-- Concrete `sanitizeSpeechText` scalar folding from hardened `nospeaker.swift`:
+    folds smart quotes/dashes to safe ASCII and restricts to `isAllowedSpeechByte`. -/
+def foldSpeechScalar (cp : Nat) : Option Nat :=
+  if cp = 0x2018 ∨ cp = 0x2019 then some 0x27
+  else if cp = 0x201C ∨ cp = 0x201D then some 0x22
+  else if cp = 0x2013 ∨ cp = 0x2014 then some 0x2D
+  else if 0x20 ≤ cp ∧ cp ≤ 0x7E ∧ cp ≠ 91 ∧ cp ≠ 93 then some cp
+  else none
+
+/-- PROOF 14.4 (Smart-Quote/Dash Scalar Folding Preserves `isAllowedSpeechByte` Soundness): -/
+theorem foldSpeechScalar_sound (cp outByte : Nat) (h : foldSpeechScalar cp = some outByte) :
+    SubprocessSecurity.isAllowedSpeechByte outByte = true := by
+  unfold foldSpeechScalar at h
+  by_cases h1 : cp = 0x2018 ∨ cp = 0x2019
+  · simp [h1] at h; subst h; decide
+  · simp only [h1, ↓reduceIte] at h
+    by_cases h2 : cp = 0x201C ∨ cp = 0x201D
+    · simp [h2] at h; subst h; decide
+    · simp only [h2, ↓reduceIte] at h
+      by_cases h3 : cp = 0x2013 ∨ cp = 0x2014
+      · simp [h3] at h; subst h; decide
+      · simp only [h3, ↓reduceIte] at h
+        by_cases h4 : 0x20 ≤ cp ∧ cp ≤ 0x7E ∧ cp ≠ 91 ∧ cp ≠ 93
+        · simp [h4] at h; subst h
+          unfold SubprocessSecurity.isAllowedSpeechByte
+          simp only [decide_eq_true_eq]
+          omega
+        · simp [h4] at h
+
+end ConcreteRefinement
+
 end NoSpeakerFormal
 
 -- Kernel Axiom Audit: Verify zero `sorryAx` and zero custom axioms on core theorems!
@@ -1724,3 +1849,7 @@ end NoSpeakerFormal
 #print axioms NoSpeakerFormal.SignalLPCAndScripts.ih13_nan_rms_and_formant_pole_sound
 #print axioms NoSpeakerFormal.SignalLPCAndScripts.ih14_play_sh_tty_and_hygiene_sound
 #print axioms NoSpeakerFormal.SignalLPCAndScripts.ih15_build_sh_strict_mode_and_atomic_dist_iff
+#print axioms NoSpeakerFormal.ConcreteRefinement.runPhase4Trace_simulates
+#print axioms NoSpeakerFormal.ConcreteRefinement.two_sigints_stop_runController
+#print axioms NoSpeakerFormal.ConcreteRefinement.isVerifiedSingleColumnGlyph_safe
+#print axioms NoSpeakerFormal.ConcreteRefinement.foldSpeechScalar_sound
