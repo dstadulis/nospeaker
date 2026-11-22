@@ -1948,29 +1948,32 @@ def round1RenderBehavior
   if sayExitZero && wavValid then .synthesizedFrames else .bogusFatalFailExit1
 
 /-- Hardened `render(_:)`: checks `phase != .running` (`shouldSkipToCredits || stopRequested`)
-    during wait slices and BEFORE `fail()`, returning `.cleanInterruptedEmpty` (`[]`) whenever
-    interrupted by `Ctrl-C` / `q` / `SIGTERM`! -/
+    AND foreground-group `childSignaled` (`p.terminationReason == .uncaughtSignal`) before `fail()`,
+    returning `.cleanInterruptedEmpty` (`[]`) whenever interrupted by `Ctrl-C` / `q` / `SIGTERM`! -/
 def hardenedRenderBehavior
-    (phase : ConcreteRefinement.RunPhase4) (sayExitZero wavValid : Bool) : RenderExitBehavior :=
-  if phase != .running then .cleanInterruptedEmpty
+    (phase : ConcreteRefinement.RunPhase4) (childSignaled sayExitZero wavValid : Bool) : RenderExitBehavior :=
+  if phase != .running || childSignaled then .cleanInterruptedEmpty
   else if sayExitZero && wavValid then .synthesizedFrames
   else .bogusFatalFailExit1
 
 /-- REFUTATION 15.5 & PROOF 15.6 (`H-2` Zero False `fail()` Exits on `Ctrl-C` During `render`): -/
 theorem h2_sigint_render_clean_abort_sound
-    (phase : ConcreteRefinement.RunPhase4) (sayExitZero wavValid : Bool) :
+    (phase : ConcreteRefinement.RunPhase4) (childSignaled sayExitZero wavValid : Bool) :
     round1RenderBehavior .jumpingToCredits false false = .bogusFatalFailExit1 ∧
     round1RenderBehavior .stopped false false = .bogusFatalFailExit1 ∧
-    (phase ≠ .running →
-      hardenedRenderBehavior phase sayExitZero wavValid = .cleanInterruptedEmpty ∧
-      hardenedRenderBehavior phase sayExitZero wavValid ≠ .bogusFatalFailExit1) := by
+    ((phase ≠ .running ∨ childSignaled = true) →
+      hardenedRenderBehavior phase childSignaled sayExitZero wavValid = .cleanInterruptedEmpty ∧
+      hardenedRenderBehavior phase childSignaled sayExitZero wavValid ≠ .bogusFatalFailExit1) := by
   refine ⟨rfl, rfl, ?_⟩
-  intro hne
-  cases phase with
-  | running => exact absurd rfl hne
-  | jumpingToCredits => simp [hardenedRenderBehavior]
-  | inCredits => simp [hardenedRenderBehavior]
-  | stopped => simp [hardenedRenderBehavior]
+  intro hor
+  rcases hor with hne | hsig
+  · cases phase with
+    | running => exact absurd rfl hne
+    | jumpingToCredits => simp [hardenedRenderBehavior]
+    | inCredits => simp [hardenedRenderBehavior]
+    | stopped => simp [hardenedRenderBehavior]
+  · subst hsig
+    cases phase <;> simp [hardenedRenderBehavior]
 
 end VerifierRound1Closure
 
