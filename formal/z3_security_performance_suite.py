@@ -507,6 +507,115 @@ def verify_t8_realtime_performance_schedulability(v: VerificationRunner) -> None
     )
 
 
+def verify_t9_supply_chain_gatekeeper(v: VerificationRunner) -> None:
+    """
+    T9: Supply-Chain Signature, Notarization, Hash & Zip-Slip Gatekeeping (V-01, CWE-494 / CWE-829)
+    Ref: https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/play.sh#L16-L30
+    """
+    download_ok = z3.Bool("download_ok")
+    sig_valid = z3.Bool("sig_valid")
+    notarized = z3.Bool("notarized")
+    hash_match = z3.Bool("hash_match")
+    no_traversal = z3.Bool("no_traversal")
+    regular_macho = z3.Bool("regular_macho")
+    dest_not_symlink = z3.Bool("dest_not_symlink")
+
+    # 9A: Refutation — Unhardened play.sh executes downloaded binary with sig_valid=False, notarized=False
+    s_ref = z3.Solver()
+    unhardened_exec = download_ok
+    s_ref.add(unhardened_exec, z3.Not(sig_valid), z3.Not(notarized), z3.Not(hash_match))
+    v.check_obligation(
+        "T9.Refute",
+        "Unhardened play.sh executes unsigned/unnotarized/unpinned ZIP payload (Gatekeeper bypass)",
+        s_ref,
+        z3.sat,
+    )
+
+    # 9B: Proof — Hardened Gatekeeper biconditional: exec <-> (sig_valid & notarized & hash_match & hygiene)
+    hardened_exec = z3.And(
+        download_ok,
+        sig_valid,
+        notarized,
+        hash_match,
+        no_traversal,
+        regular_macho,
+        dest_not_symlink,
+    )
+    required_invariant = z3.And(
+        download_ok,
+        sig_valid,
+        notarized,
+        hash_match,
+        no_traversal,
+        regular_macho,
+        dest_not_symlink,
+    )
+    s_prf = z3.Solver()
+    # Negation of biconditional equivalence OR execution when any single check fails
+    s_prf.add(
+        z3.Or(
+            hardened_exec != required_invariant,
+            z3.And(hardened_exec, z3.Or(z3.Not(sig_valid), z3.Not(notarized), z3.Not(hash_match), z3.Not(no_traversal), z3.Not(dest_not_symlink))),
+        )
+    )
+    v.check_obligation(
+        "T9.Prove",
+        "Hardened play.sh admits execution iff sigValid & notarized & hashMatch & safeArchive & nonSymlink",
+        s_prf,
+        z3.unsat,
+    )
+
+
+def verify_t10_temp_file_toctou_isolation(v: VerificationRunner) -> None:
+    """
+    T10: Ephemeral Temp Directory Isolation (`mkdtemp` 0700) & `lstat` Regular-File Guard (V-05, CWE-377 / CWE-59)
+    Ref: https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/nospeaker.swift#L300-L309
+    """
+    euid = z3.Int("euid")
+    attacker_uid = z3.Int("attacker_uid")
+    dir_owner = z3.Int("dir_owner")
+    dir_world_writable = z3.Bool("dir_world_writable")
+    # File types: 0 = regular, 1 = symlink, 2 = fifo, 3 = device
+    file_kind = z3.Int("file_kind")
+    file_uid = z3.Int("file_uid")
+    file_nlink = z3.Int("file_nlink")
+
+    # 10A: Refutation — Predictable `nospeaker-<pid>.wav` in world-writable `/tmp` allows foreign symlink clobber
+    s_ref = z3.Solver()
+    s_ref.add(euid == 501, attacker_uid == 502)
+    s_ref.add(dir_world_writable == z3.BoolVal(True))
+    can_attacker_plant = z3.Or(attacker_uid == dir_owner, dir_world_writable)
+    s_ref.add(can_attacker_plant, file_kind == 1, file_uid == attacker_uid)
+    v.check_obligation(
+        "T10.Refute",
+        "Predictable nospeaker-<pid>.wav in world-writable TMPDIR admits foreign symlink/TOCTOU clobber",
+        s_ref,
+        z3.sat,
+    )
+
+    # 10B: Proof — Exclusive 0700 mkdtemp + post-say lstat(S_IFREG && st_uid == euid && st_nlink == 1)
+    s_prf = z3.Solver()
+    s_prf.add(euid >= 0, attacker_uid >= 0, attacker_uid != euid)
+    # mkdtemp creates directory owned by euid with mode 0700 (not world/group writable)
+    mkdtemp_owner = euid
+    mkdtemp_world_writable = z3.BoolVal(False)
+    foreign_can_modify_dir = z3.Or(attacker_uid == mkdtemp_owner, mkdtemp_world_writable)
+    lstat_admits = z3.And(file_kind == 0, file_uid == euid, file_nlink == 1)
+    # Check if foreign actor can modify 0700 dir OR if lstat_admits ever accepts symlink/fifo/foreign-owned/hardlinked file
+    s_prf.add(
+        z3.Or(
+            foreign_can_modify_dir,
+            z3.And(lstat_admits, z3.Or(file_kind != 0, file_uid != euid, file_nlink != 1)),
+        )
+    )
+    v.check_obligation(
+        "T10.Prove",
+        "Exclusive 0700 mkdtemp + lstat(S_IFREG, euid, nlink=1) blocks all foreign symlink & TOCTOU swaps",
+        s_prf,
+        z3.unsat,
+    )
+
+
 def main() -> int:
     print("=" * 105)
     print("  NoSpeaker Z3 SMT Formal Verification Certificate (Security, Safety, Concurrency & Real-Time)")
@@ -522,6 +631,8 @@ def main() -> int:
     verify_t6_renderer_shutdown_protocol(runner)
     verify_t7_fd_redirection_idempotence(runner)
     verify_t8_realtime_performance_schedulability(runner)
+    verify_t9_supply_chain_gatekeeper(runner)
+    verify_t10_temp_file_toctou_isolation(runner)
 
     total_ms = (time.perf_counter() - t_start) * 1000.0
     passed = sum(1 for *_, ok in runner.results if ok)

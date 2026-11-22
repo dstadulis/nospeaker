@@ -252,3 +252,38 @@
             (not (= (bvand size_field_addr #x0000000000000003) #x0000000000000000))))
 (check-sat)
 (pop 1)
+
+; -----------------------------------------------------------------------------
+; THEOREM 5 (QF_BV): POSIX `mode_t` (16-bit) `umask 077` & `lstat` `S_IFMT == S_IFREG`
+; Ref: https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/play.sh#L18-L26
+;      https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/nospeaker.swift#L300-L309
+; -----------------------------------------------------------------------------
+(echo "=== T5A [Refutation - BV16]: Default umask 022 leaves group/world read-exec bits open (expect sat) ===")
+(push 1)
+(declare-const req_mode (_ BitVec 16))
+(assert (= req_mode #x01FF)) ; 0o0777
+(define-fun masked_022 () (_ BitVec 16) (bvand req_mode (bvnot #x0012))) ; ~0o022
+(assert (not (= (bvand masked_022 #x003F) #x0000))) ; 0o077 group/world bits non-zero!
+(check-sat)
+(pop 1)
+
+(echo "=== T5B [Proof - BV16]: umask 077 clears ALL group/world permission bits & S_IFREG excludes S_IFLNK/S_IFIFO across all 2^16 mode_t values (expect unsat) ===")
+(push 1)
+(declare-const any_mode (_ BitVec 16))
+(declare-const st_mode (_ BitVec 16))
+(define-fun umask_077 () (_ BitVec 16) #x003F)  ; 0o0077
+(define-fun s_ifmt () (_ BitVec 16) #xF000)     ; 0o170000
+(define-fun s_ifreg () (_ BitVec 16) #x8000)    ; 0o100000
+(define-fun s_iflnk () (_ BitVec 16) #xA000)    ; 0o120000
+(define-fun s_ififo () (_ BitVec 16) #x1000)    ; 0o010000
+(define-fun s_ifdir () (_ BitVec 16) #x4000)    ; 0o040000
+
+(define-fun created_mode () (_ BitVec 16) (bvand any_mode (bvnot umask_077)))
+(assert (= (bvand st_mode s_ifmt) s_ifreg))
+
+(assert (or (not (= (bvand created_mode umask_077) #x0000))
+            (= (bvand st_mode s_ifmt) s_iflnk)
+            (= (bvand st_mode s_ifmt) s_ififo)
+            (= (bvand st_mode s_ifmt) s_ifdir)))
+(check-sat)
+(pop 1)

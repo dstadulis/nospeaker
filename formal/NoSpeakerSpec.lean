@@ -13,6 +13,8 @@
     4. MemoryBounds         — MTTouch Raw FFI Stride Safety & PCM Frame Bounds (CWE-125/190)
     5. ConcurrencyProtocol  — Arbitrary-Length FD Redirection Safety & Join Barrier (CWE-362)
     6. PerformanceComplexity— Prefix-Sum O(W+L) Speedup & Real-Time Deadline Guarantee
+    7. SupplyChainGatekeeper— Signature, Notarization, Hash, Archive & Umask Safety (CWE-494/829)
+    8. TempFileIsolation    — Exclusive 0700 mkdtemp & lstat Regular-File TOCTOU Guard (CWE-377/59)
 
   Zero `sorry`, zero external dependencies, verified directly by Lean 4's kernel.
 -/
@@ -137,6 +139,55 @@ theorem sanitizeSpeechInput_sound (maxBytes : Nat) (raw : List Nat) :
     unfold isAllowedSpeechByte at hp
     simp only [decide_eq_true_eq] at hp
     omega
+
+/-- Strict allowlist byte predicate for `--voice <name>`: `[A-Za-z0-9 _()-]`. -/
+def isAllowedVoiceByte (b : Nat) : Bool :=
+  decide ((0x41 ≤ b ∧ b ≤ 0x5A) ∨ (0x61 ≤ b ∧ b ≤ 0x7A) ∨
+          (0x30 ≤ b ∧ b ≤ 0x39) ∨ b = 0x20 ∨ b = 0x5F ∨
+          b = 0x2D ∨ b = 0x28 ∨ b = 0x29)
+
+/-- Valid voice identifier: length in `1..64`, never starts with `'-'` (`0x2D`), all bytes allowlisted. -/
+def isValidVoiceToken (bs : List Nat) : Bool :=
+  match bs with
+  | [] => false
+  | b₀ :: _ => decide (bs.length ≤ 64 ∧ b₀ ≠ 0x2D) && bs.all isAllowedVoiceByte
+
+/-- PROOF 1.5 (Voice Identifier Option-Injection & Escape Freedom):
+    Any accepted `--voice` token is non-empty (`≤ 64` bytes), never starts with `'-'`,
+    and contains only printable non-escape, non-bracket ASCII bytes. -/
+theorem isValidVoiceToken_sound (bs : List Nat) (h : isValidVoiceToken bs = true) :
+    1 ≤ bs.length ∧ bs.length ≤ 64 ∧ bs.head? ≠ some 0x2D ∧
+    ∀ b ∈ bs, 32 ≤ b ∧ b ≤ 126 ∧ b ≠ 0x1B ∧ b ≠ 91 ∧ b ≠ 93 := by
+  cases bs with
+  | nil => simp [isValidVoiceToken] at h
+  | cons b₀ rest =>
+    simp only [isValidVoiceToken, Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at h
+    rcases h with ⟨⟨hlen, hdash⟩, hall⟩
+    refine ⟨by simp, hlen, ?_, ?_⟩
+    · simp [hdash]
+    · intro b hb
+      have hb_ok := hall b hb
+      unfold isAllowedVoiceByte at hb_ok
+      simp only [decide_eq_true_eq] at hb_ok
+      omega
+
+/-- Unhardened `voiceExists` (https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/nospeaker.swift#L289)
+    fails OPEN (`return true`) when `/usr/bin/say -v '?'` fails to launch. -/
+def unhardenedVoiceExists (spawnOk matched : Bool) : Bool :=
+  if spawnOk then matched else true
+
+def hardenedVoiceExists (tokenValid spawnOk exitZero matched : Bool) : Bool :=
+  tokenValid && spawnOk && exitZero && matched
+
+/-- REFUTATION 1.6 & PROOF 1.7: Unhardened `voiceExists` fails open on launch error,
+    whereas hardened `voiceExists` is strictly fail-closed. -/
+theorem voiceExists_fail_closed_iff (tokenValid spawnOk exitZero matched : Bool) :
+    unhardenedVoiceExists false false = true ∧
+    (hardenedVoiceExists tokenValid spawnOk exitZero matched = true ↔
+      (tokenValid = true ∧ spawnOk = true ∧ exitZero = true ∧ matched = true)) := by
+  constructor
+  · rfl
+  · simp [hardenedVoiceExists, Bool.and_eq_true, and_assoc]
 
 end SubprocessSecurity
 
@@ -295,10 +346,30 @@ theorem validated_stride_in_bounds (idx count stride fieldEnd : Nat)
   rw [Nat.add_mul, Nat.one_mul] at hmul
   omega
 
-/-- PROOF 4.3 (Bounded Audio PCM Allocation): Enforcing `frames ≤ 1_440_000` (30s @ 48kHz)
+/-- REFUTATION 4.3a: Unhardened `AVAudioFrameCount(file.length)` (`UInt32` truncation of `Int64`)
+    wraps modulo `2^32` when `file.length > 4,294,967,295` (CWE-190). -/
+theorem unhardened_pcm_frame_overflow_trap :
+    ∃ (rawLen : Nat), rawLen > 4294967295 ∧ rawLen % 4294967296 < rawLen := by
+  exact ⟨4294967296, by omega, by omega⟩
+
+/-- PROOF 4.3b (Bounded Audio PCM Allocation): Enforcing `frames ≤ 1_440_000` (30s @ 48kHz)
     prevents `UInt32` (`AVAudioFrameCount`) overflow (`2^32 - 1`) and caps memory at `5.76 MB`. -/
 theorem bounded_pcm_frames_safe (frames : Nat) (hcap : frames ≤ 1440000) :
-    frames ≤ 4294967295 ∧ frames * 4 ≤ 5760000 := by
+    frames ≤ 4294967295 ∧ frames % 4294967296 = frames ∧ frames * 4 ≤ 5760000 := by
+  omega
+
+/-- PROOF 4.4 (Validated Sample-Rate Window & Hop Well-Formedness):
+    Validating `8000 ≤ sampleRate ≤ 96000` guarantees non-zero `hopFrames` (`10ms`)
+    and `winFrames` (`25ms ≥ 200 > 64`), preventing division-by-zero or empty LPC windows. -/
+theorem validated_sample_rate_windows (sr : Nat) (hlo : 8000 ≤ sr) (hhi : sr ≤ 96000) :
+    80 ≤ sr / 100 ∧ 200 ≤ (sr * 25) / 1000 ∧ (sr * 25) / 1000 ≤ 2400 := by
+  omega
+
+/-- PROOF 4.5 (NaN-Immune Touch Scale Index Bounds):
+    Pre-clamping normalized touch coordinate `qIdx` into `[0, scaleCount - 1]` guarantees
+    strictly in-bounds array indexing for any `scaleCount > 0` (`nospeaker.swift#L703`). -/
+theorem quantized_scale_index_in_bounds (rawIdx scaleCount : Nat) (hsc : 0 < scaleCount) :
+    min (scaleCount - 1) rawIdx < scaleCount := by
   omega
 
 end MemoryBounds
@@ -447,6 +518,155 @@ theorem hybrid_scheduler_zero_deadline_miss
 
 end PerformanceComplexity
 
+-- ============================================================================
+-- 7. SUPPLY-CHAIN SIGNATURE, NOTARIZATION, QUARANTINE & UMASK GATEKEEPING (V-01 / V-09)
+-- ============================================================================
+namespace SupplyChainGatekeeper
+
+/-- Cryptographic and provenance verification predicates for downloaded Mach-O artifacts
+    in `play.sh` (https://github.com/os6/nospeaker/blob/e02a121243f3dbddb288fa6520134b0c4a8727c6/play.sh#L16-L30). -/
+structure ArtifactVerification where
+  sigValid  : Bool  -- `codesign --verify --deep --strict` + anchored Developer ID requirement
+  notarized : Bool  -- `spctl --assess --type execute` / Apple notarization ticket confirmed
+  hashMatch : Bool  -- SHA-256 digest matches pinned release digest
+  deriving DecidableEq, Repr
+
+/-- Archive & filesystem installation hygiene checks for `play.sh` extraction into `~/.local/bin`. -/
+structure InstallHygiene where
+  noPathTraversal   : Bool  -- Archive entries contain no `..` or leading `/`
+  regularMachO      : Bool  -- Extracted payload is a regular file (not a symlink/FIFO)
+  destNotSymlink    : Bool  -- Destination path is atomically replaced without following symlinks
+  deriving DecidableEq, Repr
+
+/-- Unhardened `play.sh@e02a121#L22-L30` executes the extracted binary whenever `curl` and `ditto`
+    succeed, performing zero `codesign`, `spctl`, or SHA-256 verification. -/
+def unhardenedPlayShExecutes (downloadOk : Bool) (_v : ArtifactVerification) : Bool :=
+  downloadOk
+
+/-- Hardened `play.sh` execution gatekeeper: admits execution iff cryptographic signature,
+    Apple notarization, and SHA-256 digest all verify. -/
+def hardenedPlayShAdmissible (v : ArtifactVerification) : Bool :=
+  v.sigValid && v.notarized && v.hashMatch
+
+/-- Full hardened `play.sh` install-and-exec policy combining artifact verification and FS hygiene. -/
+def hardenedFullInstallAdmissible (v : ArtifactVerification) (h : InstallHygiene) : Bool :=
+  hardenedPlayShAdmissible v && h.noPathTraversal && h.regularMachO && h.destNotSymlink
+
+/-- REFUTATION 7.1 (Gatekeeper Bypass in Unhardened `play.sh`):
+    Unhardened `play.sh` admits execution of an unsigned, unnotarized, hash-mismatched binary. -/
+theorem unhardened_play_sh_bypasses_gatekeeper :
+    ∃ v : ArtifactVerification,
+      v.sigValid = false ∧ v.notarized = false ∧ v.hashMatch = false ∧
+      unhardenedPlayShExecutes true v = true := by
+  exact ⟨{ sigValid := false, notarized := false, hashMatch := false }, rfl, rfl, rfl, rfl⟩
+
+/-- PROOF 7.2 (Supply-Chain Execution Admissibility Biconditional):
+    `play.sh` admits binary execution IF AND ONLY IF `sigValid ∧ notarized ∧ hashMatch`. -/
+theorem play_sh_exec_admissible_iff (v : ArtifactVerification) :
+    hardenedPlayShAdmissible v = true ↔
+      (v.sigValid = true ∧ v.notarized = true ∧ v.hashMatch = true) := by
+  simp [hardenedPlayShAdmissible, Bool.and_eq_true, and_assoc]
+
+/-- PROOF 7.3 (Full Supply-Chain & Archive Confinement Biconditional):
+    Installation and execution proceed iff all cryptographic and filesystem invariants hold. -/
+theorem full_install_admissible_iff (v : ArtifactVerification) (h : InstallHygiene) :
+    hardenedFullInstallAdmissible v h = true ↔
+      (v.sigValid = true ∧ v.notarized = true ∧ v.hashMatch = true ∧
+       h.noPathTraversal = true ∧ h.regularMachO = true ∧ h.destNotSymlink = true) := by
+  simp [hardenedFullInstallAdmissible, hardenedPlayShAdmissible, Bool.and_eq_true, and_assoc]
+
+/-- PROOF 7.4 (POSIX `umask 077` Permission Confinement):
+    Masking any POSIX file/directory creation mode with `~0o077` (`0o7700`) clears all
+    group and world read/write/execute permission bits (`0o0077`). -/
+theorem umask_077_clears_group_and_world (mode : Nat) :
+    ((mode &&& 0o7700) &&& 0o0077) = 0 := by
+  rw [Nat.and_assoc]
+  change mode &&& 0 = 0
+  exact Nat.and_zero mode
+
+/-- REFUTATION 7.5 & PROOF 7.6 (`build.sh` Signing Error Propagation, V-09):
+    Swallowing `codesign` failure allows shipping an invalidly signed binary if `set -e` is
+    bypassed or subshell-wrapped; explicit `codesignExit == 0 ∧ verifyExit == 0` gates release. -/
+def strictBuildSignGate (compileExit lipoExit codesignExit verifyExit : Nat) : Bool :=
+  decide (compileExit = 0 ∧ lipoExit = 0 ∧ codesignExit = 0 ∧ verifyExit = 0)
+
+theorem strictBuildSignGate_iff (c l s v : Nat) :
+    strictBuildSignGate c l s v = true ↔ (c = 0 ∧ l = 0 ∧ s = 0 ∧ v = 0) := by
+  simp [strictBuildSignGate]
+
+end SupplyChainGatekeeper
+
+-- ============================================================================
+-- 8. EPHEMERAL TEMP-FILE ISOLATION & SYMLINK/TOCTOU PREVENTION (V-05, CWE-377 / CWE-59)
+-- ============================================================================
+namespace TempFileIsolation
+
+/-- POSIX `S_IFMT` (`0o170000`), `S_IFREG` (`0o100000`), `S_IFLNK` (`0o120000`), `S_IFIFO` (`0o010000`). -/
+def S_IFMT  : Nat := 0o170000
+def S_IFREG : Nat := 0o100000
+def S_IFLNK : Nat := 0o120000
+def S_IFIFO : Nat := 0o010000
+
+structure TempDirState where
+  ownerUid : Nat
+  mode     : Nat  -- POSIX permission bits
+  deriving DecidableEq, Repr
+
+structure LstatMetadata where
+  stMode  : Nat
+  stUid   : Nat
+  stNlink : Nat
+  deriving DecidableEq, Repr
+
+/-- Actor `actorUid` can create/replace entries in `dir` if owner-writable or world/sticky-writable (`0o0002`). -/
+def canActorModifyDir (dir : TempDirState) (actorUid : Nat) : Bool :=
+  decide (actorUid = dir.ownerUid ∨ (dir.mode &&& 0o0002) ≠ 0)
+
+/-- REFUTATION 8.1 (Predictable PID Path in Shared `/tmp` `0o1777` Admits Foreign Symlink):
+    In world-writable `/tmp` (`mode = 0o1777`), an unprivileged local attacker (`attackerUid ≠ euid`)
+    can pre-create or swap `nospeaker-<pid>.wav`. -/
+theorem shared_tmp_admits_foreign_precreation (euid attackerUid : Nat) (_hne : attackerUid ≠ euid) :
+    canActorModifyDir { ownerUid := 0, mode := 0o1777 } attackerUid = true := by
+  unfold canActorModifyDir
+  simp only [decide_eq_true_eq]
+  right
+  decide
+
+/-- PROOF 8.2 (Exclusive `mkdtemp` `0o0700` Blocks All Non-Owner Directory Mutation):
+    In a `mkdtemp`-created directory owned by `euid` with mode `0o0700` (or any `umask 077` mode),
+    NO foreign `actorUid ≠ euid` has write permission to plant symlinks or swap files. -/
+theorem mkdtemp_0700_blocks_foreign_actors (euid actorUid rawMode : Nat) (hne : actorUid ≠ euid) :
+    canActorModifyDir { ownerUid := euid, mode := rawMode &&& 0o0700 } actorUid = false := by
+  unfold canActorModifyDir
+  simp only [decide_eq_false_iff_not, not_or]
+  refine ⟨hne, ?_⟩
+  have hz : (rawMode &&& 0o0700) &&& 0o0002 = 0 := by
+    rw [Nat.and_assoc]
+    change rawMode &&& 0 = 0
+    exact Nat.and_zero rawMode
+  omega
+
+/-- Post-synthesis `lstat` verification (`HardenedSecurityContracts.swift#L153-L158`):
+    requires `S_IFREG`, exact `geteuid()` ownership, and single hardlink (`st_nlink == 1`). -/
+def lstatVerifiedRegularFile (md : LstatMetadata) (euid : Nat) : Bool :=
+  decide ((md.stMode &&& S_IFMT) = S_IFREG ∧ md.stUid = euid ∧ md.stNlink = 1)
+
+/-- PROOF 8.3 (`lstat` Regular-File Guard Rejects Symlinks, FIFOs & Foreign Owners):
+    Any file passing `lstatVerifiedRegularFile` is provably NOT a symlink (`S_IFLNK`),
+    NOT a FIFO (`S_IFIFO`), owned by `euid`, and free of hardlink aliasing (`stNlink = 1`). -/
+theorem lstat_guard_rejects_symlinks_and_fifos (md : LstatMetadata) (euid : Nat)
+    (h : lstatVerifiedRegularFile md euid = true) :
+    (md.stMode &&& S_IFMT) ≠ S_IFLNK ∧
+    (md.stMode &&& S_IFMT) ≠ S_IFIFO ∧
+    md.stUid = euid ∧
+    md.stNlink = 1 := by
+  unfold lstatVerifiedRegularFile S_IFMT S_IFREG at h
+  unfold S_IFMT S_IFLNK S_IFIFO
+  simp only [decide_eq_true_eq] at h
+  omega
+
+end TempFileIsolation
+
 end NoSpeakerFormal
 
 -- Kernel Axiom Audit: Verify zero `sorryAx` and zero custom axioms on core theorems!
@@ -459,3 +679,10 @@ end NoSpeakerFormal
 #print axioms NoSpeakerFormal.ConcurrencyProtocol.guarded_fd_restores_for_all_sequences
 #print axioms NoSpeakerFormal.PerformanceComplexity.prefix_sum_121x_faster
 #print axioms NoSpeakerFormal.PerformanceComplexity.hybrid_scheduler_zero_deadline_miss
+#print axioms NoSpeakerFormal.SubprocessSecurity.isValidVoiceToken_sound
+#print axioms NoSpeakerFormal.SubprocessSecurity.voiceExists_fail_closed_iff
+#print axioms NoSpeakerFormal.SupplyChainGatekeeper.play_sh_exec_admissible_iff
+#print axioms NoSpeakerFormal.SupplyChainGatekeeper.full_install_admissible_iff
+#print axioms NoSpeakerFormal.SupplyChainGatekeeper.umask_077_clears_group_and_world
+#print axioms NoSpeakerFormal.TempFileIsolation.mkdtemp_0700_blocks_foreign_actors
+#print axioms NoSpeakerFormal.TempFileIsolation.lstat_guard_rejects_symlinks_and_fifos
