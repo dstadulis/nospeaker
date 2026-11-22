@@ -54,11 +54,55 @@ func pause(_ seconds: Double) {
     while now() < end && !interrupted() { usleep(5000) }
 }
 
+/// Strips C0 (`0x00...0x1F`, incl. `ESC`), `DEL` (`0x7F`), and C1 (`0x80...0x9F`, incl. `CSI`/`OSC`)
+/// bytes from untrusted strings before writing to a terminal stream, capped to `maxBytes`.
+func sanitizeTerminal(_ raw: String, maxBytes: Int = 256) -> String {
+    var clean: [UInt8] = []
+    clean.reserveCapacity(min(raw.utf8.count, maxBytes))
+    for b in raw.utf8 {
+        if b >= 0x20 && b <= 0x7E {
+            clean.append(b)
+            if clean.count >= maxBytes { break }
+        }
+    }
+    return String(decoding: clean, as: UTF8.self)
+}
+
+/// Writes all UTF-8 bytes of `s` to `fd`, retrying on `EINTR` and bounded transient `EAGAIN`
+/// so partial ANSI control sequences are never dropped mid-frame.
+func writeAll(_ fd: Int32, _ s: String) {
+    guard fd >= 0, !s.isEmpty else { return }
+    var copy = s
+    copy.withUTF8 { buf in
+        guard let base = buf.baseAddress else { return }
+        var off = 0
+        var transientRetries = 0
+        while off < buf.count {
+            let n = Darwin.write(fd, base + off, buf.count - off)
+            if n > 0 {
+                off += n
+                transientRetries = 0
+            } else if n < 0 && errno == EINTR {
+                continue
+            } else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && transientRetries < 50 {
+                transientRetries += 1
+                usleep(1000)
+            } else {
+                break
+            }
+        }
+    }
+}
+
 /// Stops with a plain explanation: a headline, then what happened and what to do, indented.
 func fail(_ message: String, headline: String = "nospeaker can't play on this Mac.", code: Int32 = 1) -> Never {
     restoreTerminal()
-    let body = message.split(separator: "\n", omittingEmptySubsequences: false).map { "  " + $0 }.joined(separator: "\n")
-    FileHandle.standardError.write(("\n  " + headline + "\n\n" + body + "\n\n").data(using: .utf8)!)
+    let safeHeadline = sanitizeTerminal(headline, maxBytes: 256)
+    let body = message
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map { "  " + sanitizeTerminal(String($0), maxBytes: 256) }
+        .joined(separator: "\n")
+    writeAll(STDERR_FILENO, "\n  " + safeHeadline + "\n\n" + body + "\n\n")
     exit(code)
 }
 /// A mistake in how it was run: says what's wrong and points at --help.
@@ -277,18 +321,57 @@ struct Frame {
     var f0 = 110.0
 }
 let hop = 0.010
-let sampleRate = 16000.0
+let defaultSampleRate = 16000.0
+let maxAllowedAudioFrames: Int64 = 1_440_000   // 30 s @ 48 kHz (<= 5.76 MiB Float32, safe for UInt32)
+let maxSpeechInputBytes = 512
 var voiceName: String?
 
-/// True if `say` has a voice by this name. (`say` quietly falls back to the default voice for unknown names.)
+/// Strict allowlist check for voice names (`[A-Za-z0-9 _()-]{1,64}`, never starting with `-`).
+func isValidVoiceToken(_ voice: String) -> Bool {
+    guard !voice.isEmpty, voice.utf8.count <= 64, !voice.hasPrefix("-") else { return false }
+    return voice.utf8.allSatisfy { b in
+        (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) ||
+        (b >= 0x30 && b <= 0x39) || b == 0x20 || b == 0x5F ||
+        b == 0x2D || b == 0x28 || b == 0x29
+    }
+}
+
+/// Neutralizes Apple Speech Synthesis Embedded Commands (`[[slnc ...]]`, `[[inpt ...]]`)
+/// and control characters, keeping printable ASCII excluding `[` (91) and `]` (93), capped at 512 bytes.
+func sanitizeSpeechText(_ raw: String) -> Data {
+    var clean: [UInt8] = []
+    clean.reserveCapacity(min(raw.utf8.count, maxSpeechInputBytes))
+    for b in raw.utf8 {
+        if b >= 0x20 && b <= 0x7E && b != 91 && b != 93 {
+            clean.append(b)
+            if clean.count >= maxSpeechInputBytes { break }
+        }
+    }
+    return Data(clean)
+}
+
+/// True if `say` has a voice by this name. Fails closed on invalid tokens, launch errors, or timeouts.
 func voiceExists(_ name: String) -> Bool {
+    guard isValidVoiceToken(name) else { return false }
     let p = Process(), pipe = Pipe()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
     p.arguments = ["-v", "?"]
+    p.standardInput = FileHandle.nullDevice
     p.standardOutput = pipe
-    guard (try? p.run()) != nil else { return true }   // can't check: let `say` decide
-    let list = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    p.standardError = FileHandle.nullDevice
+    let exitSem = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in exitSem.signal() }
+    guard (try? p.run()) != nil else { return false }
+    let data = (try? pipe.fileHandleForReading.read(upToCount: 262_144)) ?? Data()
+    try? pipe.fileHandleForReading.close()
+    if exitSem.wait(timeout: .now() + 5.0) == .timedOut {
+        p.terminate()
+        if exitSem.wait(timeout: .now() + 0.5) == .timedOut { kill(p.processIdentifier, SIGKILL) }
+        p.waitUntilExit()
+        return false
+    }
     p.waitUntilExit()
+    guard p.terminationStatus == 0, let list = String(data: data, encoding: .utf8) else { return false }
     let wanted = name.lowercased()
     return list.split(separator: "\n").contains { line in
         let l = line.lowercased()
@@ -297,22 +380,101 @@ func voiceExists(_ name: String) -> Bool {
 }
 
 func render(_ text: String) -> [Frame] {
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent("nospeaker-\(getpid()).wav")
-    defer { try? FileManager.default.removeItem(at: url) }
+    let payload = sanitizeSpeechText(text)
+    guard payload.contains(where: { $0 != 0x20 }) else { return [] }
+    if let v = voiceName, !isValidVoiceToken(v) {
+        let safeV = sanitizeTerminal(v, maxBytes: 64)
+        fail("There's no voice called \"\(safeV)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.", code: 64)
+    }
+
+    // Create an exclusive 0700 directory via mkdtemp so temp paths cannot be hijacked via symlinks/TOCTOU.
+    let rawTmp = NSTemporaryDirectory()
+    let baseDir: String
+    if rawTmp.hasPrefix("/"), rawTmp.utf8.count <= 400 {
+        baseDir = rawTmp.hasSuffix("/") ? rawTmp : (rawTmp + "/")
+    } else {
+        baseDir = "/tmp/"
+    }
+    var template = Array((baseDir + "nospeaker.XXXXXXXX").utf8CString)
+    let created = template.withUnsafeMutableBufferPointer { buf -> Bool in
+        guard let base = buf.baseAddress else { return false }
+        return mkdtemp(base) != nil
+    }
+    guard created else {
+        fail("It couldn't create a private temporary directory for speech synthesis.")
+    }
+    let dirPath = template.withUnsafeBufferPointer { buf in String(cString: buf.baseAddress!) }
+    let dirURL = URL(fileURLWithPath: dirPath, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: dirURL) }
+
+    var dirStat = stat()
+    guard lstat(dirPath, &dirStat) == 0,
+          (dirStat.st_mode & S_IFMT) == S_IFDIR,
+          dirStat.st_uid == geteuid(),
+          (dirStat.st_mode & 0o077) == 0 else {
+        fail("Temporary directory ownership or permission verification failed.")
+    }
+
+    let url = dirURL.appendingPathComponent("speech.wav", isDirectory: false)
+    var staticArgs = ["-o", url.path, "--file-format=WAVE", "--data-format=LEF32@16000"]
+    if let v = voiceName { staticArgs += ["-v", v] }
+    staticArgs += ["-f", "-"]
+
     let p = Process()
+    let stdinPipe = Pipe()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-    p.arguments = ["-o", url.path, "--file-format=WAVE", "--data-format=LEF32@16000"] + (voiceName.map { ["-v", $0] } ?? []) + [text]
+    p.arguments = staticArgs
+    p.standardInput = stdinPipe
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+
+    let exitSem = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in exitSem.signal() }
     do { try p.run() } catch { fail("It couldn't run macOS's voice (/usr/bin/say), which it needs to talk.") }
+
+    _ = fcntl(stdinPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+    try? stdinPipe.fileHandleForWriting.write(contentsOf: payload)
+    try? stdinPipe.fileHandleForWriting.close()
+
+    if exitSem.wait(timeout: .now() + 15.0) == .timedOut {
+        p.terminate()
+        if exitSem.wait(timeout: .now() + 0.5) == .timedOut { kill(p.processIdentifier, SIGKILL) }
+        p.waitUntilExit()
+        fail("macOS's voice (/usr/bin/say) took too long to prepare that line.", headline: "nospeaker couldn't prepare its voice.")
+    }
     p.waitUntilExit()
-    guard p.terminationStatus == 0, let file = try? AVAudioFile(forReading: url),
-          let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
-          (try? file.read(into: buf)) != nil, let ch = buf.floatChannelData?[0] else {
+
+    var wavStat = stat()
+    let validFile = p.terminationStatus == 0
+        && lstat(url.path, &wavStat) == 0
+        && (wavStat.st_mode & S_IFMT) == S_IFREG
+        && wavStat.st_nlink == 1
+        && wavStat.st_uid == geteuid()
+        && wavStat.st_size > 0
+        && wavStat.st_size <= 24 * 1024 * 1024
+
+    guard validFile,
+          let file = try? AVAudioFile(forReading: url),
+          file.length >= 0,
+          file.length <= maxAllowedAudioFrames else {
         if let voiceName {
-            fail("There's no voice called \"\(voiceName)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.")
+            let safeV = sanitizeTerminal(voiceName, maxBytes: 64)
+            fail("There's no voice called \"\(safeV)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.")
         }
         fail("macOS's voice (say) couldn't speak that line.", headline: "nospeaker couldn't prepare its voice.")
     }
-    var f = analyse(Array(UnsafeBufferPointer(start: ch, count: Int(buf.frameLength))))
+    if file.length == 0 { return [] }
+    let format = file.processingFormat
+    let actualSampleRate = format.sampleRate
+    guard actualSampleRate.isFinite, actualSampleRate >= 8000, actualSampleRate <= 96000,
+          format.channelCount >= 1,
+          let frameCap = UInt32(exactly: file.length),
+          let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCap)),
+          (try? file.read(into: buf)) != nil,
+          let ch = buf.floatChannelData?[0] else {
+        fail("macOS's voice (say) produced unreadable audio.", headline: "nospeaker couldn't prepare its voice.")
+    }
+    var f = analyse(Array(UnsafeBufferPointer(start: ch, count: Int(buf.frameLength))), sampleRate: actualSampleRate)
     while let first = f.first, first.level == 0 { f.removeFirst() }
     while let last = f.last, last.level == 0 { f.removeLast() }
     return f
@@ -371,8 +533,9 @@ func roots(_ a: [Double]) -> [C] {
     return z
 }
 
-func analyse(_ x: [Float]) -> [Frame] {
-    let win = Int(0.025 * sampleRate), hopN = Int(hop * sampleRate), order = 18
+func analyse(_ x: [Float], sampleRate: Double = defaultSampleRate) -> [Frame] {
+    let win = max(64, Int((0.025 * sampleRate).rounded())), hopN = max(1, Int((hop * sampleRate).rounded())), order = 18
+    guard x.count >= win else { return [] }
     let hamming = (0..<win).map { 0.54 - 0.46 * cos(2 * .pi * Double($0) / Double(win - 1)) }
     var frames: [Frame] = [], rmsList: [Double] = []
     var prev = Frame()
@@ -795,16 +958,7 @@ func unsilence() {
     savedOut = -1; savedErr = -1; outFD = STDOUT_FILENO
 }
 func out(_ s: String) {
-    let bytes = Array(s.utf8)
-    let count = bytes.count
-    bytes.withUnsafeBytes { buf in
-        var off = 0
-        while off < count {
-            let n = write(outFD, buf.baseAddress! + off, count - off)
-            if n <= 0 { break }
-            off += n
-        }
-    }
+    writeAll(outFD, s)
 }
 func takeTerminal() {
     terminalTaken = true
@@ -882,7 +1036,8 @@ final class Canvas {
     func clear() { for i in cells.indices { cells[i] = Cell() } }
     func put(_ x: Int, _ y: Int, _ ch: Character, _ fg: UInt8, bg: UInt8 = 16, bold: Bool = false) {
         guard x >= 0, y >= 0, x < w, y < h else { return }
-        cells[y * w + x] = Cell(ch: ch, fg: fg, bg: bg, bold: bold)
+        let safeCh: Character = ch.unicodeScalars.contains(where: { $0.value < 0x20 || ($0.value >= 0x7F && $0.value <= 0x9F) }) ? " " : ch
+        cells[y * w + x] = Cell(ch: safeCh, fg: fg, bg: bg, bold: bold)
     }
     func text(_ x: Int, _ y: Int, _ s: String, _ fg: UInt8, bg: UInt8 = 16, bold: Bool = false) {
         var i = x
@@ -1396,14 +1551,33 @@ func startKeys() {
                 }
                 continue
             }
-            // On the credits, F opens the X profile and stays put; any other key exits.
+            // On the credits, F opens the X profile (debounced and reaped) and stays put; any other key exits.
             if c == UInt8(ascii: "f") || c == UInt8(ascii: "F"), snapshot().waitingForKey {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                p.arguments = ["https://x.com/codycollier"]
-                try? p.run()
                 let at = now()
-                live { $0.followOpenedAt = at }
+                var shouldLaunch = false
+                live {
+                    if at - $0.followOpenedAt >= 5.0 {
+                        $0.followOpenedAt = at
+                        shouldLaunch = true
+                    }
+                }
+                if shouldLaunch {
+                    DispatchQueue.global(qos: .utility).async {
+                        let p = Process()
+                        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                        p.arguments = ["-u", "https://x.com/codycollier"]
+                        p.standardInput = FileHandle.nullDevice
+                        p.standardOutput = FileHandle.nullDevice
+                        p.standardError = FileHandle.nullDevice
+                        let exitSem = DispatchSemaphore(value: 0)
+                        p.terminationHandler = { _ in exitSem.signal() }
+                        guard (try? p.run()) != nil else { return }
+                        if exitSem.wait(timeout: .now() + 10.0) == .timedOut {
+                            p.terminate()
+                        }
+                        p.waitUntilExit()
+                    }
+                }
                 continue
             }
             keyPressed = true
@@ -1500,14 +1674,16 @@ func signOff(seconds: Int, actuations: Int) {
     // Plain bold and dim only, so it reads in any terminal theme.
     let esc = "\u{1B}["
     let vibrations = NumberFormatter.localizedString(from: NSNumber(value: actuations), number: .decimal)
-    var me = CommandLine.arguments[0].contains("/") ? CommandLine.arguments[0] : "nospeaker"
-    let home = NSHomeDirectory()
-    if me.hasPrefix(home + "/") { me = "~" + me.dropFirst(home.count) }
+    let rawArg0 = sanitizeTerminal(CommandLine.arguments.first ?? "nospeaker", maxBytes: 200)
+    var me = (rawArg0.contains("/") && !rawArg0.isEmpty) ? rawArg0 : "nospeaker"
+    let home = sanitizeTerminal(NSHomeDirectory(), maxBytes: 200)
+    if !home.isEmpty, me.hasPrefix(home + "/") { me = "~" + me.dropFirst(home.count) }
+    let clampedSeconds = max(0, seconds)
     print("")
     let lockup = logoLockup()
     for (i, line) in lockup.enumerated() { print("  " + (i < asciiLogo.count ? "\(esc)1m" : "\(esc)2m") + line + "\(esc)0m") }
     print("")
-    print("  \(esc)1m\(seconds / 60):" + String(format: "%02d", seconds % 60) + "\(esc)0m  ·  \(esc)1m\(vibrations)\(esc)0m vibrations  ·  \(esc)1m0\(esc)0m speakers used")
+    print("  \(esc)1m\(clampedSeconds / 60):" + String(format: "%02d", clampedSeconds % 60) + "\(esc)0m  ·  \(esc)1m\(vibrations)\(esc)0m vibrations  ·  \(esc)1m0\(esc)0m speakers used")
     print("  more        \(esc)1mx.com/codycollier\(esc)0m")
     print("  play again  \(esc)2m\(me)\(esc)0m")
     print("  say a line  \(esc)2m\(me) \"hello there\"\(esc)0m")
@@ -1545,13 +1721,18 @@ if flag("--help") || flag("-h") {
 
 voiceName = option("--voice", example: "Daniel")
 if let v = voiceName, !voiceExists(v) {
-    fail("There's no voice called \"\(v)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.", code: 64)
+    let safeV = sanitizeTerminal(v, maxBytes: 64)
+    fail("There's no voice called \"\(safeV)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.", code: 64)
 }
 applyTheme(light: !flag("--dark"))
 let plain = flag("--plain")
 let wantsSweep = flag("--sweep")
-if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
+if let unknown = args.first(where: { $0.hasPrefix("-") }) {
+    let safeOpt = sanitizeTerminal(unknown, maxBytes: 64)
+    usageError("\"\(safeOpt)\" isn't an option.")
+}
 
+signal(SIGPIPE, SIG_IGN)
 signal(SIGINT) { _ in requestEnd() }
 signal(SIGTERM) { _ in stopRequested = true }
 atexit { restoreTerminal() }
@@ -1564,9 +1745,10 @@ if wantsSweep || !args.isEmpty {
     if wantsSweep { print("sweeping 100 Hz → 4 kHz…"); sweep(seconds: 5) }
     if !args.isEmpty {
         let text = args.joined(separator: " ")
+        let safeText = sanitizeTerminal(text, maxBytes: 512)
         let frames = render(text)
-        print("trackpad: “\(text)”")
-        talk(frames, text: text)
+        print("trackpad: “\(safeText)”")
+        talk(frames, text: safeText)
     }
 } else {
     let interactive = isatty(STDOUT_FILENO) == 1 && isatty(STDIN_FILENO) == 1
