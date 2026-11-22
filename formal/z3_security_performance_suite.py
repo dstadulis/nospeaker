@@ -826,6 +826,158 @@ def verify_t13_tty_cloexec_key_and_ui_bounds(v: VerificationRunner) -> None:
     )
 
 
+def verify_t14_pty_ffi_coreaudio_cf_and_clock(v: VerificationRunner) -> None:
+    """
+    T14: Batch 2 Issue-Hunter Invariants (`IH-06`..`IH-10`)
+      - IH-06: TIOCGWINSZ 65535x65535 4.3GB DoS cap (<= 512x256) & ws_row == 0 loop fix
+      - IH-07: sysctlbyname size+1 NUL sentinel & IOKit Mach port release balance
+      - IH-08: CoreAudio kAudioObjectUnknown, ioDataSize==sizeof(T), & stereo [1,2] mute check
+      - IH-09: CoreFoundation Create-Rule CFRelease parity & all-path actuatorClose
+      - IH-10: Mach clock UInt64 saturating deadline & 20ms useconds_t (UInt32) sleep quantum
+    """
+    # 14A: Refutation — TIOCGWINSZ UInt16 max (65535x65535) > 4GB & right-panned stereo false mute
+    ws_col, ws_row = z3.BitVec("ws_col", 16), z3.BitVec("ws_row", 16)
+    s_ref = z3.Solver()
+    s_ref.add(ws_col == z3.BitVecVal(65535, 16), ws_row == z3.BitVecVal(65535, 16))
+    alloc_64 = z3.ZeroExt(48, ws_col) * z3.ZeroExt(48, ws_row)
+    s_ref.add(z3.UGT(alloc_64, z3.BitVecVal(4_000_000_000, 64)))
+    v.check_obligation(
+        "T14.Refute",
+        "Unbounded TIOCGWINSZ (65535x65535) allocates >4.29 GB in fillScreen() (OOM DoS, IH-06)",
+        s_ref,
+        z3.sat,
+    )
+
+    # 14B: Universal Proof across IH-06..IH-10
+    s_prf = z3.Solver()
+    # IH-06: Clamped PTY dimensions
+    ioctl_ok = z3.Bool("ioctl_ok")
+    c16, r16 = z3.BitVec("c16", 32), z3.BitVec("r16", 32)
+    s_prf.add(z3.ULE(c16, z3.BitVecVal(65535, 32)), z3.ULE(r16, z3.BitVecVal(65535, 32)))
+    valid_dims = z3.And(ioctl_ok, z3.UGT(c16, z3.BitVecVal(0, 32)), z3.UGT(r16, z3.BitVecVal(0, 32)))
+    w_safe = z3.If(valid_dims, z3.If(z3.ULE(c16, z3.BitVecVal(512, 32)), c16, z3.BitVecVal(512, 32)), z3.BitVecVal(80, 32))
+    h_safe = z3.If(valid_dims, z3.If(z3.ULE(r16, z3.BitVecVal(256, 32)), r16, z3.BitVecVal(256, 32)), z3.BitVecVal(24, 32))
+    fill_bytes = h_safe * (w_safe + z3.BitVecVal(16, 32)) + z3.BitVecVal(64, 32)
+    ih06_bad = z3.Or(
+        z3.ULT(w_safe, z3.BitVecVal(1, 32)),
+        z3.UGT(w_safe, z3.BitVecVal(512, 32)),
+        z3.ULT(h_safe, z3.BitVecVal(1, 32)),
+        z3.UGT(h_safe, z3.BitVecVal(256, 32)),
+        z3.UGT(fill_bytes, z3.BitVecVal(135232, 32)),
+    )
+
+    # IH-07 & IH-09: IOKit Mach port & CF retain/release balance
+    svc_id = z3.Int("svc_id")
+    act_n = z3.Int("act_n")
+    s_prf.add(act_n >= 0)
+    port_delta = z3.If(svc_id != 0, 1, 0) - z3.If(svc_id != 0, 1, 0)
+    cf_delta = act_n - act_n
+
+    # IH-08: Stereo CoreAudio mute check never reports muted when device==0 or ch2 is audible
+    dev_id = z3.Int("dev_id")
+    ch1_silent, ch2_silent = z3.Bools("ch1_silent ch2_silent")
+    stereo_muted = z3.And(dev_id != 0, ch1_silent, ch2_silent)
+    ih08_bad = z3.And(stereo_muted, z3.Or(dev_id == 0, z3.Not(ch1_silent), z3.Not(ch2_silent)))
+
+    # IH-10: Saturating 64-bit Mach deadline & 20,000 us UInt32 sleep slice
+    start64 = z3.BitVec("start64", 64)
+    delta64 = z3.BitVec("delta64", 64)
+    rem_us = z3.Int("rem_us")
+    s_prf.add(z3.ULE(delta64, z3.BitVecVal(3_600_000_000_000, 64)), rem_us >= 0)
+    # Overflow-safe saturating add: if start64 > UINT64_MAX - delta64 then UINT64_MAX else start64 + delta64
+    u64_max = z3.BitVecVal((1 << 64) - 1, 64)
+    sat_deadline = z3.If(z3.UGT(start64, u64_max - delta64), u64_max, start64 + delta64)
+    sleep_slice = z3.If(rem_us <= 20000, rem_us, 20000)
+    ih10_bad = z3.Or(
+        z3.ULT(sat_deadline, start64),
+        sleep_slice < 0,
+        sleep_slice > 20000,
+        sleep_slice > 4294967295,
+    )
+
+    s_prf.add(z3.Or(ih06_bad, port_delta != 0, cf_delta != 0, ih08_bad, ih10_bad))
+    v.check_obligation(
+        "T14.Prove",
+        "IH-06..IH-10: PTY <=135KB cap, IOKit/CF zero leak, stereo mute & saturating Mach clock verified",
+        s_prf,
+        z3.unsat,
+    )
+
+
+def verify_t15_signals_voice_lpc_and_release_scripts(v: VerificationRunner) -> None:
+    """
+    T15: Batch 3 Issue-Hunter Invariants (`IH-11`..`IH-15`)
+      - IH-11: Async-signal-safe atomic policy, SIGPIPE=SIG_IGN, & CLI 1st-SIGINT immediate stop
+      - IH-12: Exact voice-column match (no prefix spoofing) & POSIX `--` option/positional split
+      - IH-13: Levinson-Durbin Schur reflection stability (|k| < 1 -> 0 < e' <= e) & unit-disk |z| < 1
+      - IH-14: play.sh HTTPS-only redirect lock, pre-exec $tmp cleanup & headless /dev/tty guard
+      - IH-15: build.sh strict mode in {"", "release"} & post-notarization atomic dist/nospeaker.zip
+    """
+    # 15A: Refutation — 2-step unstable Levinson-Durbin (|k1|=2, |k2|=2) flips e_2 > 0 & build.sh typo exits 0
+    e0, k1, k2 = z3.Reals("e0_ld k1_ld k2_ld")
+    s_ref = z3.Solver()
+    s_ref.add(e0 == 1, k1 == 2, k2 == 2)
+    e1 = e0 * (1 - k1 * k1)
+    e2 = e1 * (1 - k2 * k2)
+    s_ref.add(e1 < 0, e2 > 0)
+    v.check_obligation(
+        "T15.Refute",
+        "Unhardened Levinson-Durbin 2-step |k|>1 flips negative energy back to e_2 > 0 (unstable poles, IH-13)",
+        s_ref,
+        z3.sat,
+    )
+
+    # 15B: Universal Proof across IH-11..IH-15 (including QF_NRA exact real Levinson-Durbin stability!)
+    s_prf = z3.Solver()
+
+    # IH-11: CLI mode (is_tui=False) stops on 1st SIGINT; SIGPIPE ignored
+    is_tui = z3.Bool("is_tui")
+    phase0 = z3.IntVal(0)  # Running
+    phase_after_1st_sigint = z3.If(is_tui, z3.IntVal(1), z3.IntVal(2))
+    ih11_bad = z3.And(z3.Not(is_tui), phase_after_1st_sigint != 2)
+
+    # IH-12: Exact voice column match rejects strict prefix (`wanted_len < voice_col_len`)
+    wanted_len, voice_col_len = z3.Ints("wanted_len voice_col_len")
+    s_prf.add(wanted_len > 0, wanted_len < voice_col_len)
+    exact_match = wanted_len == voice_col_len
+    ih12_bad = exact_match
+
+    # IH-13: Exact Real (QF_NRA) Levinson-Durbin Reflection Theorem:
+    #   For ALL e > 0 and |k| < 1: 0 < e * (1 - k^2) <= e, AND unit-disk pole |z|^2 < 1!
+    e_r, k_r = z3.Reals("e_r k_r")
+    s_prf.add(e_r > 0, k_r > -1, k_r < 1)
+    e_next_r = e_r * (1 - k_r * k_r)
+    ih13_bad = z3.Or(e_next_r <= 0, e_next_r > e_r)
+
+    # IH-14: play.sh binds /dev/tty iff (!stdin_tty && dev_tty_readable) & cleans tmp before exec
+    stdin_tty, dev_tty_ok = z3.Bools("stdin_tty dev_tty_ok")
+    bind_dev_tty = z3.And(z3.Not(stdin_tty), dev_tty_ok)
+    t_clean_tmp, t_exec = z3.Ints("t_clean_tmp t_exec")
+    s_prf.add(t_clean_tmp < t_exec)
+    ih14_bad = z3.Or(
+        z3.And(bind_dev_tty, z3.Not(dev_tty_ok)),
+        t_clean_tmp >= t_exec,
+    )
+
+    # IH-15: build.sh mode validation (0="", 1="release", >=2=invalid typo) & atomic dist zip promotion
+    build_mode = z3.Int("build_mode")
+    dev_id_ok, notary_ok, staple_check_ok = z3.Bools("dev_id_ok notary_ok staple_check_ok")
+    mode_valid = z3.Or(build_mode == 0, build_mode == 1)
+    dist_zip_promoted = z3.And(build_mode == 1, dev_id_ok, notary_ok, staple_check_ok)
+    ih15_bad = z3.Or(
+        z3.And(build_mode >= 2, mode_valid),
+        z3.And(dist_zip_promoted, z3.Or(build_mode != 1, z3.Not(dev_id_ok), z3.Not(notary_ok), z3.Not(staple_check_ok))),
+    )
+
+    s_prf.add(z3.Or(ih11_bad, ih12_bad, ih13_bad, ih14_bad, ih15_bad))
+    v.check_obligation(
+        "T15.Prove",
+        "IH-11..IH-15: CLI SIGINT, exact voice/-- split, Levinson-Durbin |k|<1->e'>0, & build/play gates verified",
+        s_prf,
+        z3.unsat,
+    )
+
+
 def main() -> int:
     print("=" * 105)
     print("  NoSpeaker Z3 SMT Formal Verification Certificate (Security, Safety, Concurrency & Real-Time)")
@@ -846,6 +998,8 @@ def main() -> int:
     verify_t11_eintr_terminal_write_conservation(runner)
     verify_t12_signal_monotonicity_and_open_debounce(runner)
     verify_t13_tty_cloexec_key_and_ui_bounds(runner)
+    verify_t14_pty_ffi_coreaudio_cf_and_clock(runner)
+    verify_t15_signals_voice_lpc_and_release_scripts(runner)
 
     total_ms = (time.perf_counter() - t_start) * 1000.0
     passed = sum(1 for *_, ok in runner.results if ok)

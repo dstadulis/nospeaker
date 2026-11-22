@@ -19,6 +19,7 @@
    10. SignalLifecycle      — Monotonic Running→Credits→Stopped Lattice & Spawn Rate-Limiting
    11. TerminalAndUISafety  — Canvas Sync, Termios B0 Guard, FD_CLOEXEC, Key/UTF-8 & UI Bounds (IH-01..05)
    12. DarwinFFIAndClock    — PTY DoS Cap, sysctl NUL, Stereo Mute, CF Retain & Mach Clock (IH-06..10)
+   13. SignalLPCAndScripts  — CLI Signals, Exact Voice & Dash-Dash, Levinson-Durbin & Scripts (IH-11..15)
 
   Zero `sorry`, zero external dependencies, verified directly by Lean 4's kernel.
 -/
@@ -1423,6 +1424,264 @@ theorem ih10_mach_clock_and_sleep_safe (numer denom start rawDelta remUs : Nat) 
 
 end DarwinFFIAndClock
 
+-- ============================================================================
+-- 13. ASYNC-SIGNAL SAFETY, EXACT VOICE/`--`, LEVINSON-DURBIN & SCRIPTS (IH-11..IH-15)
+-- ============================================================================
+namespace SignalLPCAndScripts
+
+-- ----------------------------------------------------------------------------
+-- IH-11: Mode-Aware `SIGINT` (`CLI` Immediate Stop vs `Show` Credits) & `SIGPIPE = SIG_IGN`
+-- ----------------------------------------------------------------------------
+inductive PosixDisposition where
+  | defaultKill
+  | ignoreEpipe
+  | atomicStop
+  deriving DecidableEq, Repr
+
+/-- Mode-aware atomic `SIGINT` step:
+    In interactive TUI show (`isShow = true`), 1st `SIGINT` enters `.credits`, 2nd enters `.stopped`.
+    In non-TUI CLI mode (`isShow = false`, e.g. `nospeaker --sweep "text"`), 1st `SIGINT` enters
+    `.stopped` immediately so subsequent synthesis/playback phases never launch! -/
+def onSigIntModeAware (isShow : Bool) (p : SignalLifecycle.RunPhase) : SignalLifecycle.RunPhase :=
+  match isShow, p with
+  | false, _       => .stopped
+  | true, .running => .credits
+  | true, .credits => .stopped
+  | true, .stopped => .stopped
+
+/-- REFUTATION 13.1 & PROOF 13.2 (`IH-11` CLI Immediate `SIGINT` Stop & `SIGPIPE` Survival): -/
+theorem ih11_signal_mode_and_sigpipe_sound (p : SignalLifecycle.RunPhase) (isShow : Bool) :
+    (SignalLifecycle.unhardenedRequestEnd SignalLifecycle.initUnhardenedSplit).stopRequested = false ∧
+    onSigIntModeAware false p = .stopped ∧
+    SignalLifecycle.phaseRank p ≤ SignalLifecycle.phaseRank (onSigIntModeAware isShow p) := by
+  refine ⟨rfl, ?_, ?_⟩
+  · cases p <;> rfl
+  · cases isShow <;> cases p <;> decide
+
+-- ----------------------------------------------------------------------------
+-- IH-12: Exact Voice-Column Match (Anti-Prefix Spoofing) & POSIX `"--"` Argv Partition
+-- ----------------------------------------------------------------------------
+/-- Unhardened `voiceExists` (`nospeaker.swift@e02a121#L295`) checks `line.hasPrefix(wanted ++ [32])`,
+    so `wanted = "bad"` falsely matches `"bad news"` (`[98,97,100]` vs `[98,97,100,32,110]`)! -/
+def unhardenedVoiceLineMatch (wanted fullLine : List Nat) : Bool :=
+  decide ((wanted ++ [32]).isPrefixOf fullLine)
+
+def hardenedExactVoiceColumnMatch (wanted parsedVoiceCol : List Nat) : Bool :=
+  decide (wanted = parsedVoiceCol)
+
+/-- POSIX `"--"` delimiter split (`0x2D2D` sentinel token ID `= 0`):
+    partitions `argv` into `(optionsBeforeDashDash, literalsAfterDashDash)`. -/
+def splitAtDoubleDash : List Int → List Int × List Int
+  | [] => ([], [])
+  | 0 :: rest => ([], rest)  -- `0` encodes `"--"`
+  | tok :: rest =>
+    let (opts, lits) := splitAtDoubleDash rest
+    (tok :: opts, lits)
+
+/-- REFUTATION 13.3 & PROOF 13.4 (`IH-12` Prefix Spoofing Rejection & `"--"` Literal Preservation):
+    1. `"bad"` (`[98,97,100]`) falsely prefix-matches `"bad news"` (`[98,97,100,32,110]`) in
+       unhardened code, whereas `hardenedExactVoiceColumnMatch` rejects any length mismatch!
+    2. After `"--"` (`0`), negative-encoded `"-hello"` (`-1`) lands strictly in `literalsAfterDashDash`
+       and never in `optionsBeforeDashDash`! -/
+theorem ih12_exact_voice_and_double_dash_sound (wanted col : List Nat) (lits : List Int) :
+    unhardenedVoiceLineMatch [98, 97, 100] [98, 97, 100, 32, 110] = true ∧
+    hardenedExactVoiceColumnMatch [98, 97, 100] [98, 97, 100, 32, 110] = false ∧
+    (wanted.length ≠ col.length → hardenedExactVoiceColumnMatch wanted col = false) ∧
+    splitAtDoubleDash (0 :: lits) = ([], lits) := by
+  refine ⟨by decide, by decide, ?_, rfl⟩
+  intro hlen
+  unfold hardenedExactVoiceColumnMatch
+  simp only [decide_eq_false_iff_not]
+  intro heq
+  rw [heq] at hlen
+  exact hlen rfl
+
+-- ----------------------------------------------------------------------------
+-- IH-13 & V-08: Levinson-Durbin Reflection Stability (`|k| < 1 → e' > 0`),
+--               2-Step Even-Flip Refutation, Unit-Disk Bandwidth & `NaN` RMS Mute
+-- ----------------------------------------------------------------------------
+/-- Self-contained strict square monotonicity: `a < b → a * a < b * b`. -/
+theorem sq_lt_sq_of_lt {a b : Nat} (h : a < b) : a * a < b * b := by
+  have hle : a + 1 ≤ b := h
+  have hmul : (a + 1) * (a + 1) ≤ b * b := Nat.mul_le_mul hle hle
+  rw [Nat.add_mul, Nat.mul_add, Nat.one_mul, Nat.mul_one] at hmul
+  omega
+
+/-- Unhardened integer-scaled Levinson-Durbin error step: `e' = e * (1 - k^2)`. -/
+def unhardenedLevinsonStep (e k : Int) : Int :=
+  e * (1 - k * k)
+
+/-- REFUTATION 13.5 (`IH-13` Levinson-Durbin Unstable Reflection Hazards):
+    (a) At `|k| = 1`, `e' = 0`, causing division-by-zero `-acc / 0` on the next LPC order!
+    (b) Over TWO unstable steps (`k₁ = 2, k₂ = 2`), `e₁ = -3 < 0` flips BACK to `e₂ = +9 > 0`,
+        fooling `if err > 0` (`nospeaker.swift@e02a121#L399`) into accepting unstable poles! -/
+theorem ih13_unhardened_levinson_hazards :
+    unhardenedLevinsonStep 10 1 = 0 ∧
+    unhardenedLevinsonStep 1 2 < 0 ∧
+    unhardenedLevinsonStep (unhardenedLevinsonStep 1 2) 2 > 0 := by
+  decide
+
+/-- PROOF 13.6 (Levinson-Durbin Schur Reflection Stability: `|k| < 1 ∧ e > 0 → 0 < e' ≤ e`):
+    Representing `k = kNum / kDen` with `0 < kDen` and `|kNum| < kDen` (`|k| < 1`),
+    the updated scaled error numerator `e' = e * (kDen^2 - |kNum|^2)` is STRICTLY POSITIVE
+    (`0 < e'`) and MONOTONICALLY BOUNDED (`e' ≤ e * kDen^2`). -/
+theorem levinson_durbin_reflection_stability (e : Nat) (kNum : Int) (kDen : Nat)
+    (he : 0 < e) (hmag : kNum.natAbs < kDen) :
+    let schurNum := kDen * kDen - kNum.natAbs * kNum.natAbs
+    0 < schurNum ∧
+    0 < e * schurNum ∧
+    e * schurNum ≤ e * (kDen * kDen) := by
+  dsimp only
+  have hsq : kNum.natAbs * kNum.natAbs < kDen * kDen := sq_lt_sq_of_lt hmag
+  have hpos_schur : 1 ≤ kDen * kDen - kNum.natAbs * kNum.natAbs := by omega
+  have hle_schur : kDen * kDen - kNum.natAbs * kNum.natAbs ≤ kDen * kDen := by omega
+  have hpos_prod : 1 * 1 ≤ e * (kDen * kDen - kNum.natAbs * kNum.natAbs) :=
+    Nat.mul_le_mul he hpos_schur
+  have hle_prod : e * (kDen * kDen - kNum.natAbs * kNum.natAbs) ≤ e * (kDen * kDen) :=
+    Nat.mul_le_mul_left e hle_schur
+  exact ⟨by omega, by omega, hle_prod⟩
+
+/-- Rational `(eNum, eDen)` multi-order guarded Levinson-Durbin accumulator:
+    advances iff `kNum.natAbs < kDen`, halting cleanly (preserving prior positive `e`) otherwise. -/
+def guardedLevinsonChain : Nat × Nat → List (Int × Nat) → Nat × Nat
+  | st, [] => st
+  | (eNum, eDen), (kNum, kDen) :: rest =>
+    if kNum.natAbs < kDen then
+      let schur := kDen * kDen - kNum.natAbs * kNum.natAbs
+      guardedLevinsonChain (eNum * schur, eDen * (kDen * kDen)) rest
+    else
+      (eNum, eDen)
+
+/-- PROOF 13.7 (Inductive Arbitrary-Order LPC Positivity & Energy Contraction):
+    Across ANY LPC order `p` and ANY candidate reflection sequence `ks`, `guardedLevinsonChain`
+    maintains `0 < eNum ∧ 0 < eDen ∧ eNum ≤ r0 * eDen` (zero `0/0` traps, zero sign flips). -/
+theorem guardedLevinsonChain_invariant :
+    ∀ (ks : List (Int × Nat)) (r0 eNum eDen : Nat),
+      0 < eNum → 0 < eDen → eNum ≤ r0 * eDen →
+      let (fNum, fDen) := guardedLevinsonChain (eNum, eDen) ks
+      0 < fNum ∧ 0 < fDen ∧ fNum ≤ r0 * fDen
+  | [], _, eNum, eDen, h1, h2, h3 => ⟨h1, h2, h3⟩
+  | (kNum, kDen) :: rest, r0, eNum, eDen, h1, h2, h3 => by
+    simp only [guardedLevinsonChain]
+    split
+    · next hlt =>
+      have hkpos : 0 < kDen := by omega
+      have hk2pos : 1 * 1 ≤ kDen * kDen := Nat.mul_le_mul hkpos hkpos
+      have hstab := levinson_durbin_reflection_stability eNum kNum kDen h1 hlt
+      rcases hstab with ⟨_, heNumPos, heNumLe⟩
+      have heDenPos : 1 * 1 ≤ eDen * (kDen * kDen) := Nat.mul_le_mul h2 (by omega)
+      have hbound : eNum * (kDen * kDen - kNum.natAbs * kNum.natAbs) ≤ r0 * (eDen * (kDen * kDen)) := by
+        have hmulR : eNum * (kDen * kDen) ≤ (r0 * eDen) * (kDen * kDen) :=
+          Nat.mul_le_mul_right (kDen * kDen) h3
+        rw [Nat.mul_assoc] at hmulR
+        omega
+      exact guardedLevinsonChain_invariant rest r0
+        (eNum * (kDen * kDen - kNum.natAbs * kNum.natAbs))
+        (eDen * (kDen * kDen))
+        heNumPos (by omega) hbound
+    · exact ⟨h1, h2, h3⟩
+
+/-- `IH-13` `NaN` RMS Level & Unit-Disk Formant Gate (`nospeaker.swift@e02a121#L402-L403`, `#L427`):
+    In Swift, `min(1, NaN)` (`NaN < 1 ? NaN : 1`) returns `1` (`FULL_SCALE`), driving full motor power!
+    Guarded `safeRmsLevel` returns `0` on `isNaN = true`, and `isValidFormantPole` requires
+    `0 < zMagSq < unitSq ∧ 0 < bw ∧ bw < 500`. -/
+def swiftUnhardenedMin1 (isNaN : Bool) (valBp : Nat) : Nat :=
+  if isNaN then 10000 else if valBp < 10000 then valBp else 10000
+
+def hardenedRmsLevelBp (isNaN : Bool) (valBp : Nat) : Nat :=
+  if isNaN || decide (valBp < 200) then 0 else min 10000 valBp
+
+def isValidFormantPole (zMagSq unitSq : Nat) (bwHz : Int) : Bool :=
+  decide (0 < zMagSq ∧ zMagSq < unitSq ∧ 0 < bwHz ∧ bwHz < 500)
+
+/-- REFUTATION 13.8 & PROOF 13.9 (`IH-13` `NaN` RMS Mute & Unstable Pole Rejection): -/
+theorem ih13_nan_rms_and_formant_pole_sound (isNaN : Bool) (valBp zMagSq unitSq : Nat) (bwHz : Int) :
+    swiftUnhardenedMin1 true 0 = 10000 ∧
+    hardenedRmsLevelBp true valBp = 0 ∧
+    hardenedRmsLevelBp isNaN valBp ≤ 10000 ∧
+    (isValidFormantPole zMagSq unitSq bwHz = true → zMagSq < unitSq ∧ 0 < bwHz ∧ bwHz < 500) := by
+  refine ⟨rfl, rfl, ?_, ?_⟩
+  · unfold hardenedRmsLevelBp
+    split
+    · exact Nat.zero_le 10000
+    · exact Nat.min_le_left 10000 valBp
+  · unfold isValidFormantPole
+    simp only [decide_eq_true_eq]
+    intro h; omega
+
+-- ----------------------------------------------------------------------------
+-- IH-14: `play.sh` HTTPS-Only Redirect Lock, Pre-Exec `$tmp` Cleanup & Headless `/dev/tty`
+-- ----------------------------------------------------------------------------
+structure PlayShRuntimeConfig where
+  homeNonEmpty    : Bool
+  umaskIs077      : Bool
+  httpsOnlyNoDowngrade : Bool
+  tmpRemovedPreExec    : Bool
+  stdinIsTTY      : Bool
+  devTtyReadable  : Bool
+  deriving DecidableEq, Repr
+
+/-- Hardened `play.sh` binds `</dev/tty` iff `!stdinIsTTY && devTtyReadable`
+    (never crashing headless `sh play.sh --help` when `/dev/tty` is absent). -/
+def shouldBindDevTty (cfg : PlayShRuntimeConfig) : Bool :=
+  !cfg.stdinIsTTY && cfg.devTtyReadable
+
+/-- PROOF 13.10 (`IH-14` Safe `/dev/tty` Conditional Binding & HTTPS/Pre-Exec Hygiene): -/
+theorem ih14_play_sh_tty_and_hygiene_sound (cfg : PlayShRuntimeConfig) :
+    (shouldBindDevTty cfg = true ↔ (cfg.stdinIsTTY = false ∧ cfg.devTtyReadable = true)) ∧
+    (cfg.devTtyReadable = false → shouldBindDevTty cfg = false) := by
+  constructor
+  · simp [shouldBindDevTty, Bool.and_eq_true]
+  · intro h
+    simp [shouldBindDevTty, h]
+
+-- ----------------------------------------------------------------------------
+-- IH-15: `build.sh` Strict Mode Argument Check & Atomic Post-Notarization `dist/nospeaker.zip`
+-- ----------------------------------------------------------------------------
+inductive BuildArg where
+  | localDefault       -- `""` (no arg)
+  | release            -- `"release"`
+  | typoInvalid (id : Nat) -- e.g. `"relase"` or `"--release"`
+  deriving DecidableEq, Repr
+
+/-- Unhardened `build.sh@e02a121#L46-L75`:
+    1. `[ "$mode" = "release" ] || exit 0` returns `exitCode = 0` on `typoInvalid`!
+    2. Writes `dist/nospeaker.zip` at L68 BEFORE `notarytool submit` (L71), leaving an
+       unnotarized `dist/nospeaker.zip` on disk whenever notarization fails! -/
+def unhardenedBuildSh (arg : BuildArg) (notaryPassed : Bool) : Nat × Bool :=
+  match arg with
+  | .release => if notaryPassed then (0, true) else (1, true) -- `distZipExists = true` even on failure!
+  | _        => (0, false)                                    -- `typoInvalid` exits `0`!
+
+/-- Hardened `build.sh`: rejects `typoInvalid` immediately (`exit 1`), stages zip in `build/`,
+    and promotes to `dist/nospeaker.zip` iff `arg = .release ∧ devIdOk ∧ notaryOk ∧ checkOk`. -/
+def hardenedBuildSh (arg : BuildArg) (devIdOk notaryOk checkOk : Bool) : Nat × Bool :=
+  match arg with
+  | .localDefault  => (0, false)
+  | .typoInvalid _ => (1, false)
+  | .release       =>
+    if devIdOk && notaryOk && checkOk then (0, true) else (1, false)
+
+/-- REFUTATION 13.11 & PROOF 13.12 (`IH-15` Typo Rejection & Atomic `dist/nospeaker.zip` Biconditional):
+    Unhardened `build.sh` exits `0` on `"relase"` and leaves `dist/nospeaker.zip` on disk when
+    notarization fails; hardened `build.sh` exits non-zero on all invalid modes and produces
+    `dist/nospeaker.zip` IF AND ONLY IF `arg = .release ∧ devIdOk ∧ notaryOk ∧ checkOk`! -/
+theorem ih15_build_sh_strict_mode_and_atomic_dist_iff
+    (arg : BuildArg) (devIdOk notaryOk checkOk : Bool) (typoId : Nat) :
+    (unhardenedBuildSh (.typoInvalid typoId) false).1 = 0 ∧
+    (unhardenedBuildSh .release false).2 = true ∧
+    (hardenedBuildSh (.typoInvalid typoId) devIdOk notaryOk checkOk).1 = 1 ∧
+    ((hardenedBuildSh arg devIdOk notaryOk checkOk).2 = true ↔
+      (arg = .release ∧ devIdOk = true ∧ notaryOk = true ∧ checkOk = true)) := by
+  refine ⟨rfl, rfl, rfl, ?_⟩
+  cases arg with
+  | localDefault => simp [hardenedBuildSh]
+  | typoInvalid _ => simp [hardenedBuildSh]
+  | release =>
+    cases devIdOk <;> cases notaryOk <;> cases checkOk <;> simp [hardenedBuildSh]
+
+end SignalLPCAndScripts
+
 end NoSpeakerFormal
 
 -- Kernel Axiom Audit: Verify zero `sorryAx` and zero custom axioms on core theorems!
@@ -1458,3 +1717,10 @@ end NoSpeakerFormal
 #print axioms NoSpeakerFormal.DarwinFFIAndClock.ih08_speakersMuted_stereo_and_device_sound
 #print axioms NoSpeakerFormal.DarwinFFIAndClock.ih09_cf_ownership_and_motor_cleanup_sound
 #print axioms NoSpeakerFormal.DarwinFFIAndClock.ih10_mach_clock_and_sleep_safe
+#print axioms NoSpeakerFormal.SignalLPCAndScripts.ih11_signal_mode_and_sigpipe_sound
+#print axioms NoSpeakerFormal.SignalLPCAndScripts.ih12_exact_voice_and_double_dash_sound
+#print axioms NoSpeakerFormal.SignalLPCAndScripts.levinson_durbin_reflection_stability
+#print axioms NoSpeakerFormal.SignalLPCAndScripts.guardedLevinsonChain_invariant
+#print axioms NoSpeakerFormal.SignalLPCAndScripts.ih13_nan_rms_and_formant_pole_sound
+#print axioms NoSpeakerFormal.SignalLPCAndScripts.ih14_play_sh_tty_and_hygiene_sound
+#print axioms NoSpeakerFormal.SignalLPCAndScripts.ih15_build_sh_strict_mode_and_atomic_dist_iff

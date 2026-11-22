@@ -338,6 +338,55 @@ public enum FastSpeechDSP {
         let f0 = (voiced && bestLag > 0) ? (sampleRate / Double(bestLag)) : 110.0
         return (voiced, min(maxHz, max(minHz, f0)))
     }
+
+    /// Schur-guarded Levinson-Durbin LPC solver (`IH-13` / `V-08`, Lean `levinson_durbin_reflection_stability`).
+    /// Enforces `|k| <= 0.999999` and `e > 1e-12` at every order so error energy `e` stays strictly
+    /// positive (`0 < e' <= e`), preventing `-acc / 0` `NaN` traps and 2-step unstable sign flips.
+    public static func solveLPCGuarded(
+        windowed: [Double],
+        order p: Int
+    ) -> (coeffs: [Double], predictionError: Double) {
+        guard p >= 1, windowed.count > p else {
+            return ([1.0], 0.0)
+        }
+        var r = [Double](repeating: 0.0, count: p + 1)
+        for k in 0...p {
+            var s = 0.0
+            for i in k..<windowed.count {
+                let prod = windowed[i] * windowed[i - k]
+                if prod.isFinite { s += prod }
+            }
+            r[k] = s
+        }
+        var a = [Double](repeating: 0.0, count: p + 1)
+        a[0] = 1.0
+        guard r[0].isFinite, r[0] > 1e-12 else { return (a, 0.0) }
+        r[0] *= 1.0001
+        var e = r[0]
+        for i in 1...p {
+            guard e.isFinite, e > 1e-12 else { break }
+            var acc = r[i]
+            for j in 1..<i { acc += a[j] * r[i - j] }
+            let k = -acc / e
+            guard k.isFinite, abs(k) <= 0.999999 else { break }
+            var nextA = a
+            for j in 1..<i { nextA[j] = a[j] + k * a[i - j] }
+            nextA[i] = k
+            a = nextA
+            e *= (1.0 - k * k)
+        }
+        return (a, e.isFinite && e > 0.0 ? e : 0.0)
+    }
+
+    /// `NaN`-safe RMS perceptual envelope (`IH-13`, Z3 `T6B.2` & Lean `ih13_nan_rms_and_formant_pole_sound`).
+    /// Prevents Swift's `min(1.0, Double.nan) == 1.0` from driving full haptic scale on corrupted PCM.
+    public static func safePerceptualLevel(rms: Double, peak: Double) -> Float {
+        guard rms.isFinite, peak.isFinite, rms > 0.0, peak > 1e-9 else { return 0.0 }
+        let rel = rms / peak
+        guard rel.isFinite, rel >= 0.02 else { return 0.0 }
+        let shaped = pow(rel, 0.45)
+        return VerifiedActuation.clampFinite32(Float(shaped), lo: 0.0, hi: 1.0, fallback: 0.0)
+    }
 }
 
 // MARK: - 5. Concurrency Safety, Heap Lock, FD Idempotence & Safe Touch Reader (Swift 6 Sendable)
