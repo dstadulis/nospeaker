@@ -251,14 +251,62 @@ func pause(_ seconds: Double) {
     while now() < end && !interrupted() { usleep(5000) }
 }
 
+/// Strips C0 (`0x00...0x1F`, incl. `ESC`), `DEL` (`0x7F`), and C1 (`0x80...0x9F`, incl. `CSI`/`OSC`)
+/// bytes from untrusted strings before writing to a terminal stream, capped to `maxBytes`.
+func sanitizeTerminal(_ raw: String, maxBytes: Int = 256) -> String {
+    var clean: [UInt8] = []
+    clean.reserveCapacity(min(raw.utf8.count, maxBytes))
+    for b in raw.utf8 {
+        if b >= 0x20 && b <= 0x7E {
+            clean.append(b)
+            if clean.count >= maxBytes { break }
+        }
+    }
+    return String(decoding: clean, as: UTF8.self)
+}
+
+/// Writes all UTF-8 bytes of `s` to `fd`, retrying on `EINTR` and bounded transient `EAGAIN`
+/// so partial ANSI control sequences are never dropped mid-frame.
+@discardableResult
+func writeAll(_ fd: Int32, _ s: String) -> Bool {
+    guard fd >= 0 else { return false }
+    if s.isEmpty { return true }
+    var copy = s
+    return copy.withUTF8 { buf in
+        guard let base = buf.baseAddress else { return true }
+        var off = 0
+        var transientRetries = 0
+        while off < buf.count {
+            let n = Darwin.write(fd, base + off, buf.count - off)
+            if n > 0 {
+                off += n
+                transientRetries = 0
+            } else if n < 0 && errno == EINTR {
+                continue
+            } else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && transientRetries < 50 {
+                transientRetries += 1
+                usleep(1000)
+            } else {
+                return false
+            }
+        }
+        return true
+    }
+}
+
 /// Stops with a plain explanation: a headline, then what happened and what to do, indented.
 func fail(_ message: String, headline: String = "nospeaker can't play on this Mac.", code: Int32 = 1) -> Never {
     stopRenderer()
     restoreTerminal()
+    fdGuard.unsilence()
     stopTouch()
     motorRuntime.closeMotor()
-    let body = message.split(separator: "\n", omittingEmptySubsequences: false).map { "  " + $0 }.joined(separator: "\n")
-    FileHandle.standardError.write(("\n  " + headline + "\n\n" + body + "\n\n").data(using: .utf8)!)
+    let safeHeadline = sanitizeTerminal(headline, maxBytes: 256)
+    let body = message
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map { "  " + sanitizeTerminal(String($0), maxBytes: 256) }
+        .joined(separator: "\n")
+    _ = writeAll(STDERR_FILENO, "\n  " + safeHeadline + "\n\n" + body + "\n\n")
     exit(code)
 }
 /// A mistake in how it was run: says what's wrong and points at --help.
@@ -334,7 +382,7 @@ func macModel() -> String {
     }
     guard rc == 0 else { return "" }
     let prefix = buf.prefix(while: { $0 != 0 })
-    return String(decoding: prefix, as: UTF8.self)
+    return sanitizeTerminal(String(decoding: prefix, as: UTF8.self), maxBytes: 128)
 }
 
 func hasSmartBattery() -> Bool {
@@ -365,6 +413,22 @@ func noTrackpad(_ found: Bool) -> Never {
     fail(message)
 }
 
+/// Total IEEE-754 finite clamp (`NaN -> fallback`, `-Inf/<=lo -> lo`, `+Inf/>=hi -> hi`).
+@inline(__always)
+func clampFinite(_ x: Double, lo: Double, hi: Double, fallback: Double) -> Double {
+    if x.isNaN { return fallback }
+    if x <= lo { return lo }
+    if x >= hi { return hi }
+    return x
+}
+
+@inline(__always)
+func clampFinite32(_ x: Float, lo: Float, hi: Float, fallback: Float) -> Float {
+    if x.isNaN { return fallback }
+    if x <= lo { return lo }
+    if x >= hi { return hi }
+    return x
+}
 
 final class MotorRuntime: @unchecked Sendable {
     struct State {
@@ -605,10 +669,10 @@ func startTouch() -> Bool {
     let devs = motorRuntime.matchingTouchDevices()
     guard !devs.isEmpty else { return false }
     _ = motorRuntime.setTouchActive(true)
-    let quiet = !isTerminalTaken()
-    if quiet { silenceOthers() }
+    let quiet = !terminalController.isTaken
+    if quiet { fdGuard.silence() }
     for d in devs { registerCallback(d, onTouchFrame); deviceStart(d, 0) }
-    if quiet { usleep(200_000); unsilence() }
+    if quiet { usleep(200_000); fdGuard.unsilence() }
     return true
 }
 
@@ -620,7 +684,6 @@ func stopTouch() {
     }
     touchState.withLock { $0 = Contact() }
 }
-
 
 // MARK: - Speech analysis
 
@@ -779,7 +842,7 @@ func render(_ text: String) -> [Frame] {
     guard payload.contains(where: { $0 != 0x20 }) else { return [] }
     let configuredVoice = appConfig.withLock { $0.voiceName }
     if let v = configuredVoice, !isValidVoiceToken(v) {
-        let safeV = v
+        let safeV = sanitizeTerminal(v, maxBytes: 64)
         fail("There's no voice called \"\(safeV)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.", code: 64)
     }
 
@@ -903,7 +966,7 @@ func render(_ text: String) -> [Frame] {
           file.length <= maxAllowedAudioFrames else {
         if runControl.shouldSkipToCredits || runControl.stopRequested { return [] }
         if let configuredVoice {
-            let safeV = configuredVoice
+            let safeV = sanitizeTerminal(configuredVoice, maxBytes: 64)
             fail("There's no voice called \"\(safeV)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.")
         }
         fail("macOS's voice (say) couldn't speak that line.", headline: "nospeaker couldn't prepare its voice.")
@@ -925,7 +988,6 @@ func render(_ text: String) -> [Frame] {
     while let last = f.last, last.level == 0 { f.removeLast() }
     return f
 }
-
 
 func lpc(_ x: [Double], order p: Int) -> ([Double], Double) {
     var r = [Double](repeating: 0, count: p + 1)
@@ -1409,93 +1471,169 @@ func sayAnything() {
     live { $0.inputActive = false }
 }
 
-// MARK: - Terminal
+// MARK: - Terminal & FD Isolation
 
-struct LegacyTerminalState: Sendable {
-    var savedTermios = termios()
-    var terminalTaken = false
-    var outFD: Int32 = STDOUT_FILENO
-    var savedOut: Int32 = -1
-    var savedErr: Int32 = -1
-}
-
-let legacyTerm = HeapUnfairLock(LegacyTerminalState())
-func isTerminalTaken() -> Bool { legacyTerm.withLock { $0.terminalTaken } }
-
-func silenceOthers() {
-    legacyTerm.withLock { s in
-        fflush(stdout); fflush(stderr)
-        s.savedOut = dup(STDOUT_FILENO); s.savedErr = dup(STDERR_FILENO)
-        s.outFD = s.savedOut
-        let null = open("/dev/null", O_WRONLY)
-        dup2(null, STDOUT_FILENO); dup2(null, STDERR_FILENO); close(null)
+/// Idempotent, close-on-exec stdout/stderr `/dev/null` redirection guard.
+final class IdempotentFDGuard: Sendable {
+    private struct Descriptors {
+        var savedOut: Int32 = -1
+        var savedErr: Int32 = -1
+        var activeOutFD: Int32 = STDOUT_FILENO
     }
-}
-func unsilence() {
-    legacyTerm.withLock { s in
-        guard s.savedOut >= 0 else { return }
-        fflush(stdout); fflush(stderr)
-        dup2(s.savedOut, STDOUT_FILENO); dup2(s.savedErr, STDERR_FILENO)
-        close(s.savedOut); close(s.savedErr)
-        s.savedOut = -1; s.savedErr = -1; s.outFD = STDOUT_FILENO
+    private let state = HeapUnfairLock(Descriptors())
+
+    var renderOutputFD: Int32 { state.withLock { $0.activeOutFD } }
+
+    func silence() {
+        state.withLock { d in
+            guard d.savedOut < 0 else { return }
+            let nullFD = Darwin.open("/dev/null", O_WRONLY | O_CLOEXEC)
+            guard nullFD >= 0 else { return }
+            let dupOut = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0)
+            let dupErr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)
+            guard dupOut >= 0, dupErr >= 0 else {
+                if dupOut >= 0 { close(dupOut) }
+                if dupErr >= 0 { close(dupErr) }
+                close(nullFD)
+                return
+            }
+            fflush(stdout)
+            fflush(stderr)
+            guard dup2(nullFD, STDOUT_FILENO) >= 0, dup2(nullFD, STDERR_FILENO) >= 0 else {
+                _ = dup2(dupOut, STDOUT_FILENO)
+                _ = dup2(dupErr, STDERR_FILENO)
+                close(dupOut)
+                close(dupErr)
+                close(nullFD)
+                return
+            }
+            close(nullFD)
+            d.savedOut = dupOut
+            d.savedErr = dupErr
+            d.activeOutFD = dupOut
+        }
     }
-}
-func out(_ s: String) {
-    let fd = legacyTerm.withLock { $0.outFD }
-    let bytes = Array(s.utf8)
-    let count = bytes.count
-    bytes.withUnsafeBytes { buf in
-        guard let base = buf.baseAddress else { return }
-        var off = 0
-        while off < count {
-            let n = write(fd, base + off, count - off)
-            if n <= 0 { break }
-            off += n
+
+    func unsilence() {
+        state.withLock { d in
+            guard d.savedOut >= 0, d.savedErr >= 0 else { return }
+            fflush(stdout)
+            fflush(stderr)
+            _ = dup2(d.savedOut, STDOUT_FILENO)
+            _ = dup2(d.savedErr, STDERR_FILENO)
+            close(d.savedOut)
+            close(d.savedErr)
+            d.savedOut = -1
+            d.savedErr = -1
+            d.activeOutFD = STDOUT_FILENO
         }
     }
 }
-func takeTerminal() {
-    legacyTerm.withLock { s in
-        s.terminalTaken = true
-        tcgetattr(STDIN_FILENO, &s.savedTermios)
-        var t = s.savedTermios
-        t.c_lflag &= ~tcflag_t(ICANON | ECHO)
-        tcsetattr(STDIN_FILENO, TCSANOW, &t)
-    }
-    silenceOthers()
-    out("\u{1B}[?1049h\u{1B}[?25l\u{1B}[?1000h\u{1B}[?1002h\u{1B}[?1006h" + fillScreen())
+
+let fdGuard = IdempotentFDGuard()
+
+@discardableResult
+func out(_ s: String) -> Bool {
+    writeAll(fdGuard.renderOutputFD, s)
 }
-func restoreTerminal() {
-    let savedOpt: termios? = legacyTerm.withLock { s in
-        guard s.terminalTaken else { return nil }
-        s.terminalTaken = false
-        return s.savedTermios
+
+final class TerminalController: Sendable {
+    private struct State {
+        var savedTermios = termios()
+        var termiosSaved = false
+        var taken = false
     }
-    guard var saved = savedOpt else { return }
-    out("\u{1B}[?1006l\u{1B}[?1002l\u{1B}[?1000l\u{1B}[0m\u{1B}[2J\u{1B}[?25h\u{1B}[?1049l")
-    unsilence()
-    tcsetattr(STDIN_FILENO, TCSANOW, &saved)
+    private let state = HeapUnfairLock(State())
+    private let fds: IdempotentFDGuard
+
+    init(fdGuard: IdempotentFDGuard) {
+        self.fds = fdGuard
+    }
+
+    var isTaken: Bool { state.withLock { $0.taken } }
+
+    private static func getTermios(_ t: inout termios) -> Bool {
+        while true {
+            let rc = tcgetattr(STDIN_FILENO, &t)
+            if rc == 0 { return true }
+            if errno != EINTR { return false }
+        }
+    }
+
+    private static func setTermios(_ t: inout termios) {
+        while tcsetattr(STDIN_FILENO, TCSANOW, &t) < 0 && errno == EINTR {}
+    }
+
+    func take() {
+        let didAcquire = state.withLock { s -> Bool in
+            guard !s.taken else { return false }
+            s.taken = true
+            var orig = termios()
+            if Self.getTermios(&orig) {
+                s.savedTermios = orig
+                s.termiosSaved = true
+                var raw = orig
+                raw.c_lflag &= ~tcflag_t(ICANON | ECHO)
+                withUnsafeMutableBytes(of: &raw.c_cc) { cc in
+                    if Int(VMIN) < cc.count { cc[Int(VMIN)] = 1 }
+                    if Int(VTIME) < cc.count { cc[Int(VTIME)] = 0 }
+                }
+                Self.setTermios(&raw)
+            } else {
+                s.termiosSaved = false
+            }
+            return true
+        }
+        guard didAcquire else { return }
+        fds.silence()
+        _ = out("\u{1B}[?1049h\u{1B}[?25l" + fillScreen())
+    }
+
+    func restore() {
+        let snapshotState = state.withLock { s -> (wasTaken: Bool, saved: termios, hasTermios: Bool) in
+            guard s.taken else { return (false, s.savedTermios, false) }
+            s.taken = false
+            let hasT = s.termiosSaved
+            s.termiosSaved = false
+            return (true, s.savedTermios, hasT)
+        }
+        guard snapshotState.wasTaken else { return }
+        _ = out("\u{1B}[0m\u{1B}[2J\u{1B}[?25h\u{1B}[?1049l")
+        fds.unsilence()
+        if snapshotState.hasTermios {
+            var orig = snapshotState.saved
+            Self.setTermios(&orig)
+        }
+    }
 }
+
+let terminalController = TerminalController(fdGuard: fdGuard)
+func takeTerminal() { terminalController.take() }
+func restoreTerminal() { terminalController.restore() }
 func onExitRestore() {
     stopRenderer()
-    restoreTerminal()
-    unsilence()
+    terminalController.restore()
+    fdGuard.unsilence()
 }
+
 /// Paints the whole terminal in the theme's background (not just the show's 80×24 block), so the show sits
 /// centred on one page however big the window is.
 func fillScreen() -> String {
     let size = terminalSize()
     let bg = themeStore.withLock { $0.screenBackground }
     let row = String(repeating: " ", count: size.w)
-    var s = "\u{1B}[0m" + bg + "\u{1B}[2J"
+    var s = ""
+    s.reserveCapacity(size.h * (size.w + 12) + 32)
+    s += "\u{1B}[0m" + bg + "\u{1B}[2J"
     for y in 0..<size.h { s += "\u{1B}[\(y + 1);1H" + row }
     return s
 }
 
 func terminalSize() -> (w: Int, h: Int) {
-    let fd = legacyTerm.withLock { $0.outFD }
     var ws = winsize()
-    if ioctl(fd, TIOCGWINSZ, &ws) == 0, ws.ws_col > 0 { return (Int(ws.ws_col), Int(ws.ws_row)) }
+    if ioctl(fdGuard.renderOutputFD, TIOCGWINSZ, &ws) == 0, ws.ws_col > 0, ws.ws_row > 0 {
+        return (min(Int(ws.ws_col), 512), min(Int(ws.ws_row), 256))
+    }
     return (80, 24)
 }
 
@@ -1542,20 +1680,53 @@ func applyTheme(light: Bool) {
     }
 }
 
+/// Verified 1-column terminal glyph predicate: printable ASCII (`0x20...0x7E`) plus the exact
+/// 13 single-width Unicode box/symbol glyphs used by the UI, guaranteeing `wcwidth == 1`
+/// and zero C0/C1/combining/wide-character column desynchronization.
+func isVerifiedSingleColumnGlyph(_ ch: Character) -> Bool {
+    guard ch.unicodeScalars.count == 1, let s = ch.unicodeScalars.first else { return false }
+    if s.value >= 0x20 && s.value <= 0x7E { return true }
+    switch s.value {
+    case 0x00B7, 0x00BB, 0x201C, 0x201D,
+         0x2500, 0x2502, 0x256D, 0x256E, 0x256F, 0x2570,
+         0x2588, 0x25B6, 0x25B8:
+        return true
+    default:
+        return false
+    }
+}
+
+/// Total Euclidean non-negative modulo (`0 <= modPositive(i, count) < count` for all `count > 0`).
+@inline(__always)
+func modPositive(_ i: Int, _ count: Int) -> Int {
+    guard count > 0 else { return 0 }
+    let r = i % count
+    return r < 0 ? r + count : r
+}
+
+/// Total normalized index quantizer (`0 <= safeIndex(u, count) < count` across all IEEE-754 bit patterns).
+@inline(__always)
+func safeIndex(_ u: Double, count: Int) -> Int {
+    guard count > 1 else { return 0 }
+    let clamped = clampFinite(u, lo: 0.0, hi: 1.0, fallback: 0.0)
+    return min(count - 1, max(0, Int(clamped * Double(count - 1) + 0.5)))
+}
+
 final class Canvas {
     let w = 80, h = 24
     var cells = [Cell](repeating: Cell(), count: 80 * 24)
     func clear() { for i in cells.indices { cells[i] = Cell() } }
     func put(_ x: Int, _ y: Int, _ ch: Character, _ fg: UInt8, bg: UInt8 = 16, bold: Bool = false) {
         guard x >= 0, y >= 0, x < w, y < h else { return }
-        cells[y * w + x] = Cell(ch: ch, fg: fg, bg: bg, bold: bold)
+        let safeCh: Character = isVerifiedSingleColumnGlyph(ch) ? ch : " "
+        cells[y * w + x] = Cell(ch: safeCh, fg: fg, bg: bg, bold: bold)
     }
     func text(_ x: Int, _ y: Int, _ s: String, _ fg: UInt8, bg: UInt8 = 16, bold: Bool = false) {
         var i = x
         for c in s { put(i, y, c, fg, bg: bg, bold: bold); i += 1 }
     }
     func centered(_ y: Int, _ s: String, _ fg: UInt8, bold: Bool = false) { text((w - s.count) / 2, y, s, fg, bold: bold) }
-    /// What the terminal is showing now, to send only the cells that changed.
+    /// What the terminal is showing now, committed strictly after a full `out(frame)` write succeeds.
     var shown: [Cell]?
     func changes(originX: Int, originY: Int, rgbTable: [String]) -> String {
         var s = ""
@@ -1572,9 +1743,9 @@ final class Canvas {
             pen = c
             writeAt = (i % w == w - 1) ? -1 : i + 1
         }
-        shown = cells
         return s.isEmpty ? "" : s + "\u{1B}[0m"
     }
+    func commitShown() { shown = cells }
 }
 
 // MARK: - Look
@@ -1584,7 +1755,12 @@ final class Canvas {
 let inkC: UInt8 = 255, bodyC: UInt8 = 251, midC: UInt8 = 247, dimC: UInt8 = 243, ruleC: UInt8 = 240, faintC: UInt8 = 236
 let paperC: UInt8 = 16
 
-func typed(_ s: String, since: Double, cps: Double, at t: Double) -> String { String(s.prefix(max(0, Int((t - since) * cps)))) }
+func typed(_ s: String, since: Double, cps: Double, at t: Double) -> String {
+    let dt = (t - since) * cps
+    guard dt.isFinite, dt > 0 else { return "" }
+    let n = dt >= Double(s.count) ? s.count : Int(dt)
+    return String(s.prefix(max(0, n)))
+}
 func dots(_ label: String, _ value: String, width: Int) -> String {
     label + " " + String(repeating: ".", count: max(1, width - label.count - value.count - 2)) + " "
 }
@@ -1636,20 +1812,24 @@ func drawSlant(_ cv: Canvas, _ text: String, y: Int, color: UInt8 = inkC) {
 }
 /// Classic ASCII shading, light to dense.
 let ramp: [Character] = [" ", ".", ":", "-", "=", "+", "*", "#", "%", "@"]
-func shade(_ v: Double) -> Character { ramp[max(0, min(ramp.count - 1, Int(v * Double(ramp.count - 1) + 0.5)))] }
+func shade(_ v: Double) -> Character {
+    ramp[safeIndex(v, count: ramp.count)]
+}
 /// "[=======>        ]" style bar, inside the given width (brackets included).
 func asciiBar(_ v: Double, width: Int) -> String {
-    let inner = width - 2, fill = Int(max(0, min(1, v)) * Double(inner))
+    let inner = max(1, width - 2)
+    let u = clampFinite(v, lo: 0.0, hi: 1.0, fallback: 0.0)
+    let fill = min(inner, max(0, Int(u * Double(inner))))
     return "[" + String(repeating: "=", count: max(0, fill - 1)) + (fill > 0 ? ">" : "") + String(repeating: " ", count: inner - fill) + "]"
 }
 
 /// A silver shimmer travelling along `i` (no colour).
 let silver: [UInt8] = [245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 255, 254, 253, 252, 251, 250, 249, 248, 247, 246]
-func shimmer(_ i: Int) -> UInt8 { silver[((i % silver.count) + silver.count) % silver.count] }
+func shimmer(_ i: Int) -> UInt8 {
+    silver[modPositive(i, silver.count)]
+}
 
 let scrollText = "      ·  a90.com presents  NO SPEAKER  ·    the trackpad has no speaker. every sound you hear is its haptic motor, driven through MultitouchSupport, a private macOS framework.    range: 100 to 4000 vibrations per second.    voice: two formants, retriggered on every pitch beat.    thanks for listening.    a90.com    "
-
-
 let scrollChars = Array(scrollText)
 
 struct RenderMemory {
@@ -1678,7 +1858,6 @@ func draw(_ cv: Canvas, _ s: LiveState, _ t: Double, _ mem: RenderMemory) {
     drawLogo(cv, y: 2)
     if s.scene == .intro { drawSplash(cv, s, t); return }
 
-
     switch s.scene {
     case .heart: drawHeart(cv, s, t)
     case .sweep: drawSweep(cv, s, t)
@@ -1696,19 +1875,20 @@ func draw(_ cv: Canvas, _ s: LiveState, _ t: Double, _ mem: RenderMemory) {
     let badge = String(format: " %02d/%02d ", s.part, partCount)
     cv.text(1, 21, badge, paperC, bg: inkC, bold: true)
     cv.text(1 + badge.count + 1, 21, s.partName, inkC, bold: true)
-    let active = t - s.lastPlay < 0.08
+    let active = t - s.lastPlay < 0.08 && s.hz.isFinite
     cv.text(24, 21, "motor", dimC)
     cv.text(30, 21, active ? String(format: "%4.0f hz", s.hz) : "idle", active ? inkC : dimC, bold: active)
     cv.text(38, 21, asciiBar(active ? s.level : 0, width: 10), bodyC)
     if let muted = s.muted {
         let chip = muted ? " SPEAKERS MUTED " : " SPEAKERS ON · MUTE "
-        let blink = !muted && Int(t * 2.5) % 2 == 0
+        let blink = !muted && Int(max(0, t) * 2.5) % 2 == 0
         cv.text(79 - chip.count, 21, chip, blink ? inkC : paperC, bg: blink ? faintC : inkC, bold: true)
     }
     cv.text(2, 22, "space skip · q end", faintC)
     // Scroller.
     for x in 0..<80 {
-        let c = scrollChars[(x + mem.marquee) % scrollChars.count]
+        let idx = (x + mem.marquee) % scrollChars.count
+        let c = scrollChars[idx]
         cv.put(x, 23, c, shimmer((x + mem.marquee) / 2), bold: true)
     }
 }
@@ -1727,7 +1907,8 @@ func drawSplash(_ cv: Canvas, _ s: LiveState, _ t: Double) {
         if voices < total {
             let width = 28, fill = Int(Double(width) * Double(voices) / Double(total))
             let barText = String(repeating: "=", count: max(0, fill - 1)) + (fill > 0 ? ">" : "") + String(repeating: " ", count: width - fill)
-            cv.text(x + 2, 14, "preparing the voice [\(barText)] \(voices)/\(total) " + ["|", "/", "-", "\\"][Int(t * 10) % 4], bodyC)
+            let spin = Int(max(0, t) * 10) % 4
+            cv.text(x + 2, 14, "preparing the voice [\(barText)] \(voices)/\(total) " + ["|", "/", "-", "\\"][spin], bodyC)
         } else {
             line(14, "preparing the voice", "ready")
         }
@@ -1742,30 +1923,35 @@ func drawSplash(_ cv: Canvas, _ s: LiveState, _ t: Double) {
 func drawProof(_ cv: Canvas, _ s: LiveState, _ t: Double, y: Int) {
     guard let muted = s.muted else { return }
     let text = "   " + (muted ? "SPEAKERS MUTED  ·  EVERY SOUND YOU HEAR IS THE TRACKPAD" : "SPEAKERS ARE ON  ·  MUTE YOUR MAC FIRST") + "   "
-    let blink = !muted && Int(t * 2.5) % 2 == 0
+    let blink = !muted && Int(max(0, t) * 2.5) % 2 == 0
     cv.text((80 - text.count) / 2, y, text, blink ? inkC : paperC, bg: blink ? faintC : inkC, bold: true)
 }
 
 let heartArt = [",d88b.d88b,", "88888888888", "`Y8888888Y'", "  `Y888Y'", "    `Y'"]
 func drawHeart(_ cv: Canvas, _ s: LiveState, _ t: Double) {
-    let pulse = max(0, 1 - (t - s.lastPlay) / 0.35) * s.level
+    let rawPulse = max(0, 1 - (t - s.lastPlay) / 0.35) * s.level
+    let pulse = rawPulse.isFinite ? min(1.0, max(0.0, rawPulse)) : 0.0
     let shades: [UInt8] = [236, 238, 240, 243, 246, 249, 252, 255]
-    let color = shades[min(shades.count - 1, Int(pulse * Double(shades.count - 1) + 0.5))]
+    let color = shades[min(shades.count - 1, max(0, Int(pulse * Double(shades.count - 1) + 0.5)))]
     for (y, row) in heartArt.enumerated() { cv.text(34, 11 + y, row, color, bold: pulse > 0.3) }
     cv.centered(19, "waking up the motor", pulse > 0.3 ? inkC : dimC, bold: pulse > 0.3)
 }
 
-func xForHz(_ f: Double) -> Int { 3 + Int(log(max(100, min(4000, f)) / 100) / log(40) * 73) }
+func xForHz(_ f: Double) -> Int {
+    let clamped = f.isFinite ? max(100.0, min(4000.0, f)) : 100.0
+    return 3 + Int(log(clamped / 100.0) / log(40.0) * 73.0)
+}
 
 func drawSweep(_ cv: Canvas, _ s: LiveState, _ t: Double) {
-    let f = t - s.lastPlay < 0.1 ? s.hz : 0
+    let f = (t - s.lastPlay < 0.1 && s.hz.isFinite && s.hz > 0) ? min(9999.0, s.hz) : 0
     drawSlant(cv, f > 0 ? String(Int(f)) + " Hz" : "100 Hz", y: 10)
     // A live wave: more cycles as the pitch climbs.
     let levels: [Character] = ["_", ".", "-", "~", "^"]
     let cycles = 1 + 22 * log(max(100, f) / 100) / log(40)
     for x in 0..<76 {
         let v = f > 0 ? sin(2 * .pi * cycles * Double(x) / 76 - t * 12) : 0
-        cv.put(2 + x, 16, f > 0 ? levels[min(4, Int((v + 1) / 2 * 4.99))] : "-", f > 0 ? shimmer(x / 3 + Int(t * 10)) : faintC, bold: true)
+        let lvlIdx = v.isFinite ? min(4, max(0, Int((v + 1) / 2 * 4.99))) : 2
+        cv.put(2 + x, 16, f > 0 ? levels[lvlIdx] : "-", f > 0 ? shimmer(x / 3 + Int(max(0, t) * 10)) : faintC, bold: true)
     }
     // Ruler, 100 Hz to 4 kHz (log), with a marker.
     for x in 3...76 { cv.put(x, 18, "-", faintC) }
@@ -1778,10 +1964,11 @@ func drawSweep(_ cv: Canvas, _ s: LiveState, _ t: Double) {
 }
 
 func drawCaption(_ cv: Canvas, _ s: LiveState, _ t: Double, y: Int) {
-    let progress = min(1, (t - s.captionStart) / max(0.2, s.captionDur) * 1.15)
-    let shown = String(s.caption.prefix(Int(Double(s.caption.count) * progress)))
+    let rawProg = (t - s.captionStart) / max(0.2, s.captionDur) * 1.15
+    let progress = rawProg.isFinite ? min(1.0, max(0.0, rawProg)) : 0.0
+    let shown = String(s.caption.prefix(max(0, Int(Double(s.caption.count) * progress))))
     // A blinking caret while it types; the closing quote once the line is done.
-    let caret = progress >= 1 ? "”" : Int(t * 3) % 2 == 0 ? "█" : " "
+    let caret = progress >= 1 ? "”" : Int(max(0, t) * 3) % 2 == 0 ? "█" : " "
     var lines: [String] = [], line = ""
     for word in shown.split(separator: " ", omittingEmptySubsequences: false) {
         if line.count + word.count + 1 > 64 { lines.append(line); line = String(word) } else { line += line.isEmpty ? String(word) : " " + word }
@@ -1797,9 +1984,10 @@ func drawCaption(_ cv: Canvas, _ s: LiveState, _ t: Double, y: Int) {
 
 func meter(_ cv: Canvas, y: Int, label: String, value: Double, lo: Double, hi: Double) {
     cv.text(6, y, label, inkC, bold: true)
-    let v = value > 0 ? (value - lo) / (hi - lo) : 0
+    let valid = value.isFinite && value > 0
+    let v = valid ? (value - lo) / (hi - lo) : 0
     cv.text(10, y, asciiBar(v, width: 46), bodyC)
-    cv.text(57, y, value > 0 ? String(format: "%5.0f hz", value) : "    -   ", value > 0 ? inkC : dimC)
+    cv.text(57, y, valid ? String(format: "%5.0f hz", value) : "    -   ", valid ? inkC : dimC)
 }
 
 func drawTalk(_ cv: Canvas, _ s: LiveState, _ t: Double) {
@@ -1814,7 +2002,7 @@ func drawTalk(_ cv: Canvas, _ s: LiveState, _ t: Double) {
         let fx = 100 * pow(40, Double(x - 3) / 73)
         var v = 0.0
         if on {
-            for (f, a) in [(s.f1, 1.0), (s.f2, 0.8)] where f > 0 { v += a * exp(-pow(log(fx / f) / 0.12, 2)) }
+            for (f, a) in [(s.f1, 1.0), (s.f2, 0.8)] where f.isFinite && f > 0 { v += a * exp(-pow(log(fx / f) / 0.12, 2)) }
             v *= s.level
         }
         let c = shade(min(1, v))
@@ -1837,7 +2025,7 @@ func drawSing(_ cv: Canvas, _ s: LiveState, _ t: Double, rollHistory: [Int]) {
     }
     cv.text(70, 11, "»", inkC, bold: true)
     cv.text(72, 11, s.noteRow >= 0 ? s.noteName : "", inkC, bold: true)
-    if s.noteRow >= 0 { cv.text(70, 12, String(format: "%4.0fhz", s.hz), midC) }
+    if s.noteRow >= 0, s.hz.isFinite { cv.text(70, 12, String(format: "%4.0fhz", s.hz), midC) }
     cv.centered(17, "an original hook in the motor's loudest, cleanest octave", bodyC)
     cv.centered(18, "scoops · glides · vibrato", dimC)
 }
@@ -1892,7 +2080,9 @@ func drawTouch(_ cv: Canvas, _ s: LiveState, _ t: Double, trail: [(x: Double, y:
     let names = ["G5", "A5", "B5", "C6", "E6", "F6", "G6", "A6", "B6", "C7"]
     for (i, n) in names.enumerated() where i % 3 == 0 { cv.text(x0 + 2 + i * 34 / names.count, y0 + h - 2, n, ruleC) }
     for (k, p) in trail.enumerated() {
-        let px = x0 + 1 + Int(p.x * Double(w - 3)), py = y0 + 1 + Int((1 - p.y) * Double(h - 3))
+        let sx = p.x.isFinite ? min(1.0, max(0.0, p.x)) : 0.5
+        let sy = p.y.isFinite ? min(1.0, max(0.0, p.y)) : 0.5
+        let px = x0 + 1 + Int(sx * Double(w - 3)), py = y0 + 1 + Int((1 - sy) * Double(h - 3))
         let isNow = k == trail.count - 1 && s.touchDown
         cv.put(px, py, isNow ? "@" : "o", isNow ? inkC : shimmer(k), bold: true)
     }
@@ -1900,7 +2090,7 @@ func drawTouch(_ cv: Canvas, _ s: LiveState, _ t: Double, trail: [(x: Double, y:
     if s.touchMissed {
         cv.text(rx, 12, "no touch, skipping", dimC)
     } else if !s.touchSeen {
-        let blink = Int(t * 3) % 2 == 0
+        let blink = Int(max(0, t) * 3) % 2 == 0
         cv.text(rx, 11, "▶ PUT A FINGER ON", blink ? inkC : midC, bold: true)
         cv.text(rx, 12, "  THE TRACKPAD", blink ? inkC : midC, bold: true)
         cv.text(rx, 14, "glide lightly, no need to click", midC)
@@ -1910,7 +2100,7 @@ func drawTouch(_ cv: Canvas, _ s: LiveState, _ t: Double, trail: [(x: Double, y:
         cv.text(rx, 12, "slide left/right   pitch", bodyC)
         cv.text(rx, 13, "move up            vibrato", bodyC)
         cv.text(rx, 14, "glide lightly, don't click", dimC)
-        let on = s.touchDown && t - s.lastPlay < 0.08
+        let on = s.touchDown && t - s.lastPlay < 0.08 && s.hz.isFinite
         cv.text(rx, 16, "note", dimC); cv.text(rx + 6, 16, on ? s.noteName : "-", inkC, bold: true)
         cv.text(rx + 12, 16, on ? String(format: "%4.0f hz", s.hz) : "", midC)
         cv.text(rx, 17, asciiBar(on ? s.level : 0, width: 22), bodyC)
@@ -1929,7 +2119,7 @@ func drawSay(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     cv.text(x0, 13, "|", s.inputActive ? bodyC : ruleC); cv.text(x0 + w - 1, 13, "|", s.inputActive ? bodyC : ruleC)
     cv.text(x0, 14, "+" + String(repeating: "-", count: w - 2) + "+", s.inputActive ? bodyC : ruleC)
     if s.inputActive {
-        let caret = Int(t * 2.5) % 2 == 0 ? "_" : " "
+        let caret = Int(max(0, t) * 2.5) % 2 == 0 ? "_" : " "
         let shown = String(s.inputText.suffix(w - 6))
         cv.text(x0 + 2, 13, ">", midC)
         cv.text(x0 + 4, 13, shown + caret, inkC, bold: true)
@@ -1940,7 +2130,8 @@ func drawSay(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     }
     switch s.sayStatus {
     case "preparing":
-        cv.text(6, 16, "preparing the voice " + ["|", "/", "-", "\\"][Int(t * 10) % 4], midC)
+        let spin = Int(max(0, t) * 10) % 4
+        cv.text(6, 16, "preparing the voice " + ["|", "/", "-", "\\"][spin], midC)
     case "speaking":
         drawCaption(cv, s, t, y: 16)
     default:
@@ -1954,11 +2145,22 @@ func drawSay(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     cv.text(6 + finish.count + 2, 19, "· return says it", dimC)
 }
 
+func formatCountASCII(_ n: Int) -> String {
+    let raw = Array(String(max(0, n)))
+    var out = ""
+    out.reserveCapacity(raw.count + raw.count / 3)
+    for (idx, ch) in raw.enumerated() {
+        if idx > 0 && (raw.count - idx) % 3 == 0 { out.append(",") }
+        out.append(ch)
+    }
+    return out
+}
+
 func drawOutro(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     let rows: [(String, String)] = [
         ("code · sound · design", "a90"), ("web", "a90.com"),
-        ("speakers used", "0"), ("vibrations", NumberFormatter.localizedString(from: NSNumber(value: s.actuations), number: .decimal)),
-        ("runtime", String(format: "%.1f s", t - s.started)),
+        ("speakers used", "0"), ("vibrations", formatCountASCII(s.actuations)),
+        ("runtime", String(format: "%.1f s", max(0, t - s.started))),
     ]
     cv.centered(10, "C R E D I T S", inkC, bold: true)
     for (i, r) in rows.enumerated() {
@@ -1976,7 +2178,7 @@ func drawOutro(_ cv: Canvas, _ s: LiveState, _ t: Double) {
         if t - s.followOpenedAt < 2.5 {
             cv.centered(19, "opened x.com/codycollier in your browser", bodyC)
         } else {
-            let blink = Int(t * 2) % 2 == 0
+            let blink = Int(max(0, t) * 2) % 2 == 0
             cv.centered(19, "any other key exits", blink ? midC : dimC)
         }
     } else {
@@ -2044,7 +2246,13 @@ func startRenderer() {
             let rgb = themeStore.withLock { $0.rgbTable }
             let diff = cv.changes(originX: max(0, (size.w - 80) / 2), originY: max(0, (size.h - 24) / 2), rgbTable: rgb)
             let frame = prefix + diff
-            if !frame.isEmpty { out(frame) }
+            if frame.isEmpty {
+                cv.commitShown()
+            } else if out(frame) {
+                cv.commitShown()
+            } else {
+                cv.shown = nil
+            }
             // A steady frame clock: 24 fps while playing (the scroller steps every other frame, 12 chars/s),
             // 8 fps while waiting on the credits (one step a frame).
             let period = s.waitingForKey ? 0.125 : 1.0 / 24
@@ -2067,26 +2275,103 @@ func startRenderer() {
 
 func stopRenderer() { rendererLifecycle.stopAndJoin() }
 
-
 /// True when a byte is ready on stdin within `ms` milliseconds.
 func waitForInput(ms: Int) -> Bool {
     var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
-    return poll(&fds, 1, Int32(ms)) > 0
+    while true {
+        let r = Darwin.poll(&fds, 1, Int32(max(0, min(ms, 1000))))
+        if r < 0 && errno == EINTR { continue }
+        return r > 0
+    }
 }
 
 func startKeys() {
     let th = Thread {
-        var c: UInt8 = 0
+        var pendingByte: UInt8?
+
+        func nextStdinByte() -> Int? {
+            if let b = pendingByte {
+                pendingByte = nil
+                return Int(b)
+            }
+            var raw: UInt8 = 0
+            while !runControl.stopRequested {
+                let n = Darwin.read(STDIN_FILENO, &raw, 1)
+                if n == 1 { return Int(raw) }
+                if n == 0 { return nil }
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK { usleep(10_000); continue }
+                return nil
+            }
+            return nil
+        }
+
         while !runControl.stopRequested {
-            guard read(STDIN_FILENO, &c, 1) == 1 else { usleep(10_000); continue }
+            guard let byteVal = nextStdinByte() else { break }
+            let c = UInt8(byteVal)
+
+            // Decode UTF-8 multi-byte sequences atomically so continuation bytes (0x80...0xBF)
+            // are never dropped piecemeal or misinterpreted, and fold common smart punctuation to ASCII.
+            if c >= 0x80 {
+                let needed: Int
+                if (0xC2...0xDF).contains(c) { needed = 1 }
+                else if (0xE0...0xEF).contains(c) { needed = 2 }
+                else if (0xF0...0xF4).contains(c) { needed = 3 }
+                else { continue }
+
+                var seq: [UInt8] = [c]
+                var valid = true
+                for _ in 0..<needed {
+                    guard waitForInput(ms: 30) else { valid = false; break }
+                    var cont: UInt8 = 0
+                    guard Darwin.read(STDIN_FILENO, &cont, 1) == 1 else { valid = false; break }
+                    if (cont & 0xC0) == 0x80 {
+                        seq.append(cont)
+                    } else {
+                        pendingByte = cont
+                        valid = false
+                        break
+                    }
+                }
+                guard valid, let decoded = String(bytes: seq, encoding: .utf8),
+                      decoded.unicodeScalars.count == 1,
+                      let scalar = decoded.unicodeScalars.first,
+                      scalar.value >= 0xA0 else { continue }
+
+                if snapshot().inputActive {
+                    let mapped: Character?
+                    switch scalar.value {
+                    case 0x2018, 0x2019: mapped = "'"
+                    case 0x201C, 0x201D: mapped = "\""
+                    case 0x2013, 0x2014: mapped = "-"
+                    default: mapped = nil
+                    }
+                    if let ch = mapped {
+                        live { if $0.inputText.count < 70 { $0.inputText.append(ch) } }
+                    }
+                } else {
+                    runControl.setKeyPressed(true)
+                }
+                continue
+            }
+
             // Typing a line for it to say: every key is text, except return, backspace, tab and esc.
             if snapshot().inputActive {
                 if c == 27 {
-                    if waitForInput(ms: 30) {   // a sequence (scroll, arrow): drop it
-                        var b: UInt8 = 0, first = true
-                        while waitForInput(ms: 30), read(STDIN_FILENO, &b, 1) == 1 {
-                            if first { first = false; if b == UInt8(ascii: "[") || b == UInt8(ascii: "O") { continue } }
-                            if (0x40...0x7E).contains(b) { break }
+                    if waitForInput(ms: 30) {
+                        var b: UInt8 = 0
+                        guard Darwin.read(STDIN_FILENO, &b, 1) == 1 else { continue }
+                        if b == 27 { live { $0.inputDone = true }; continue }
+                        if b == UInt8(ascii: "[") || b == UInt8(ascii: "O") {
+                            var chByte: UInt8 = 0
+                            while waitForInput(ms: 30), Darwin.read(STDIN_FILENO, &chByte, 1) == 1 {
+                                if chByte == UInt8(ascii: "M") {
+                                    var discard: UInt8 = 0
+                                    for _ in 0..<3 where waitForInput(ms: 30) { _ = Darwin.read(STDIN_FILENO, &discard, 1) }
+                                    break
+                                }
+                                if (0x40...0x7E).contains(chByte) { break }
+                            }
                         }
                     } else {
                         live { $0.inputDone = true }
@@ -2098,32 +2383,58 @@ func startKeys() {
                     live { if $0.inputText.isEmpty { $0.inputText = suggestion } }
                 } else if c == 127 || c == 8 {
                     live { if !$0.inputText.isEmpty { $0.inputText.removeLast() } }
-                } else if (32...126).contains(c) {
+                } else if (32...126).contains(c), c != 91, c != 93 {
                     let ch = Character(UnicodeScalar(c))
                     live { if $0.inputText.count < 70 { $0.inputText.append(ch) } }
                 }
                 continue
             }
             if c == 27 {
-                // Esc alone quits; Esc followed quickly by "[" or "O" is a sequence (a scroll, a click, an
-                // arrow key): read it to its end and ignore it.
+                // Esc alone quits; double-Esc also quits; Esc followed quickly by "[" or "O" is a sequence.
                 guard waitForInput(ms: 30) else { requestEnd(); continue }
                 var next: UInt8 = 0
-                guard read(STDIN_FILENO, &next, 1) == 1 else { continue }
+                guard Darwin.read(STDIN_FILENO, &next, 1) == 1 else { continue }
+                if next == 27 { requestEnd(); continue }
                 if next == UInt8(ascii: "[") || next == UInt8(ascii: "O") {
                     var b: UInt8 = 0
-                    while waitForInput(ms: 30), read(STDIN_FILENO, &b, 1) == 1 { if (0x40...0x7E).contains(b) { break } }
+                    while waitForInput(ms: 30), Darwin.read(STDIN_FILENO, &b, 1) == 1 {
+                        if b == UInt8(ascii: "M") {
+                            var discard: UInt8 = 0
+                            for _ in 0..<3 where waitForInput(ms: 30) { _ = Darwin.read(STDIN_FILENO, &discard, 1) }
+                            break
+                        }
+                        if (0x40...0x7E).contains(b) { break }
+                    }
                 }
                 continue
             }
-            // On the credits, F opens the X profile and stays put; any other key exits.
+            // On the credits, F opens the X profile (debounced and reaped) and stays put; any other key exits.
             if c == UInt8(ascii: "f") || c == UInt8(ascii: "F"), snapshot().waitingForKey {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                p.arguments = ["https://x.com/codycollier"]
-                try? p.run()
                 let at = now()
-                live { $0.followOpenedAt = at }
+                var shouldLaunch = false
+                live {
+                    if at - $0.followOpenedAt >= 5.0 {
+                        $0.followOpenedAt = at
+                        shouldLaunch = true
+                    }
+                }
+                if shouldLaunch {
+                    DispatchQueue.global(qos: .utility).async {
+                        let p = Process()
+                        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                        p.arguments = ["-u", "https://x.com/codycollier"]
+                        p.standardInput = FileHandle.nullDevice
+                        p.standardOutput = FileHandle.nullDevice
+                        p.standardError = FileHandle.nullDevice
+                        let exitSem = DispatchSemaphore(value: 0)
+                        p.terminationHandler = { _ in exitSem.signal() }
+                        guard (try? p.run()) != nil else { return }
+                        if exitSem.wait(timeout: .now() + 10.0) == .timedOut {
+                            p.terminate()
+                        }
+                        p.waitUntilExit()
+                    }
+                }
                 continue
             }
             runControl.setKeyPressed(true)
@@ -2218,15 +2529,17 @@ func signOff(seconds: Int, actuations: Int) {
     // The sign-off: the logo stays in their terminal as a souvenir, with what to run next.
     // Plain bold and dim only, so it reads in any terminal theme.
     let esc = "\u{1B}["
-    let vibrations = NumberFormatter.localizedString(from: NSNumber(value: actuations), number: .decimal)
-    var me = CommandLine.arguments[0].contains("/") ? CommandLine.arguments[0] : "nospeaker"
-    let home = NSHomeDirectory()
-    if me.hasPrefix(home + "/") { me = "~" + me.dropFirst(home.count) }
+    let vibrations = formatCountASCII(actuations)
+    let rawArg0 = sanitizeTerminal(CommandLine.arguments.first ?? "nospeaker", maxBytes: 200)
+    var me = (rawArg0.contains("/") && !rawArg0.isEmpty) ? rawArg0 : "nospeaker"
+    let home = sanitizeTerminal(NSHomeDirectory(), maxBytes: 200)
+    if !home.isEmpty, me.hasPrefix(home + "/") { me = "~" + me.dropFirst(home.count) }
+    let clampedSeconds = max(0, seconds)
     print("")
     let lockup = logoLockup()
     for (i, line) in lockup.enumerated() { print("  " + (i < asciiLogo.count ? "\(esc)1m" : "\(esc)2m") + line + "\(esc)0m") }
     print("")
-    print("  \(esc)1m\(seconds / 60):" + String(format: "%02d", seconds % 60) + "\(esc)0m  ·  \(esc)1m\(vibrations)\(esc)0m vibrations  ·  \(esc)1m0\(esc)0m speakers used")
+    print("  \(esc)1m\(clampedSeconds / 60):" + String(format: "%02d", clampedSeconds % 60) + "\(esc)0m  ·  \(esc)1m\(vibrations)\(esc)0m vibrations  ·  \(esc)1m0\(esc)0m speakers used")
     print("  more        \(esc)1mx.com/codycollier\(esc)0m")
     print("  play again  \(esc)2m\(me)\(esc)0m")
     print("  say a line  \(esc)2m\(me) \"hello there\"\(esc)0m")
@@ -2286,7 +2599,7 @@ func runMain() {
 
     let selectedVoice = option("--voice", example: "Daniel")
     if let v = selectedVoice, !voiceExists(v) {
-        let safeV = v
+        let safeV = sanitizeTerminal(v, maxBytes: 64)
         fail("There's no voice called \"\(safeV)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.", code: 64)
     }
     appConfig.withLock { $0.voiceName = selectedVoice }
@@ -2294,7 +2607,7 @@ func runMain() {
     let plain = flag("--plain")
     let wantsSweep = flag("--sweep")
     if let unknown = optArgs.first(where: { $0.hasPrefix("-") }) {
-        let safeOpt = unknown
+        let safeOpt = sanitizeTerminal(unknown, maxBytes: 64)
         usageError("\"\(safeOpt)\" isn't an option.")
     }
     let args = optArgs + postDashArgs
@@ -2319,10 +2632,11 @@ func runMain() {
         if wantsSweep { print("sweeping 100 Hz → 4 kHz…"); sweep(seconds: 5) }
         if !args.isEmpty && !runControl.interrupted {
             let text = args.joined(separator: " ")
+            let safeText = sanitizeTerminal(text, maxBytes: 512)
             let frames = render(text)
             if !runControl.interrupted {
-                print("trackpad: “\(text)”")
-                talk(frames, text: text)
+                print("trackpad: “\(safeText)”")
+                talk(frames, text: safeText)
             }
         }
     } else {
