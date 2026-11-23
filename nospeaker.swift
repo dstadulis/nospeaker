@@ -23,40 +23,240 @@ import Darwin
 import IOKit
 import Foundation
 
-// MARK: - Run state, keys, clock
+// MARK: - Heap-allocated unfair lock & async-signal-safe lifecycle
 
-var stopRequested = false
-var skipRequested = false
-var keyPressed = false
-/// Leaving goes through the credits: the first Ctrl-C (or q, or esc) jumps there, the next one exits.
-var jumpToCredits = false
-var inCredits = false
-func requestEnd() { if inCredits || jumpToCredits { stopRequested = true } else { jumpToCredits = true } }
-func interrupted() -> Bool { stopRequested || skipRequested || jumpToCredits }
+/// Heap-allocated `os_unfair_lock` container: eliminates Swift `&globalVar` Law-of-Exclusivity UB
+/// and satisfies Swift 6 `Sendable` checking across threads and C callbacks.
+final class HeapUnfairLock<State>: @unchecked Sendable {
+    private let lockPtr: UnsafeMutablePointer<os_unfair_lock>
+    private var state: State
 
-var timebase = mach_timebase_info_data_t()
-mach_timebase_info(&timebase)
-let ticksPerSecond = 1e9 * Double(timebase.denom) / Double(timebase.numer)
-let t0 = mach_absolute_time()
-func now() -> Double { Double(mach_absolute_time() - t0) / ticksPerSecond }
-/// Waits for a moment on the clock: sleeps, and spins only for the last ~1.5 ms (keeps timing tight
-/// without pinning a CPU core).
-func waitUntil(_ t: UInt64) {
-    let margin = UInt64(0.0015 * ticksPerSecond)
-    while !stopRequested {
-        let n = mach_absolute_time()
-        if n >= t { return }
-        if t - n > margin { usleep(useconds_t(Double(t - n - margin) / ticksPerSecond * 1e6)) }
+    init(_ initial: State) {
+        self.lockPtr = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        self.lockPtr.initialize(to: os_unfair_lock())
+        self.state = initial
+    }
+
+    deinit {
+        lockPtr.deinitialize(count: 1)
+        lockPtr.deallocate()
+    }
+
+    @inline(__always)
+    func withLock<R>(_ body: (inout State) -> R) -> R {
+        os_unfair_lock_lock(lockPtr)
+        defer { os_unfair_lock_unlock(lockPtr) }
+        return body(&state)
     }
 }
+
+/// Monotonic lifecycle lattice: `running (0) -> jumpingToCredits (1) -> inCredits (2) -> stopped (3)`.
+enum RunPhase: Int, Comparable, Sendable {
+    case running = 0
+    case jumpingToCredits = 1
+    case inCredits = 2
+    case stopped = 3
+
+    static func < (lhs: RunPhase, rhs: RunPhase) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+final class RunController: Sendable {
+    private struct State {
+        var phase: RunPhase = .running
+        var skipRequested = false
+        var keyPressed = false
+        var cliMode = false
+    }
+    private let state = HeapUnfairLock(State())
+
+    func setCLIMode(_ enabled: Bool) {
+        state.withLock { $0.cliMode = enabled }
+    }
+
+    /// Leaving goes through the credits in the TUI show (`running -> jumpingToCredits`),
+    /// and exits immediately on the second request (`jumpingToCredits | inCredits -> stopped`)
+    /// or on the first request in CLI / pre-show mode.
+    func requestEnd() {
+        state.withLock { s in
+            if s.cliMode {
+                s.phase = .stopped
+                return
+            }
+            switch s.phase {
+            case .running:
+                s.phase = .jumpingToCredits
+            case .jumpingToCredits, .inCredits, .stopped:
+                s.phase = .stopped
+            }
+        }
+    }
+
+    func requestHardStop() {
+        state.withLock { $0.phase = .stopped }
+    }
+
+    /// Monotonically enters `.inCredits` unless `.stopped` has already been reached.
+    func beginCreditsScene() -> Bool {
+        state.withLock { s in
+            guard s.phase != .stopped else { return false }
+            if s.phase < .inCredits { s.phase = .inCredits }
+            s.skipRequested = false
+            return true
+        }
+    }
+
+    var stopRequested: Bool {
+        state.withLock { $0.phase == .stopped }
+    }
+
+    var shouldSkipToCredits: Bool {
+        state.withLock { $0.phase == .jumpingToCredits || $0.phase == .stopped }
+    }
+
+    var interrupted: Bool {
+        state.withLock { $0.phase == .jumpingToCredits || $0.phase == .stopped || $0.skipRequested }
+    }
+
+    func setSkipRequested(_ v: Bool) {
+        state.withLock { $0.skipRequested = v }
+    }
+
+    var skipRequested: Bool {
+        state.withLock { $0.skipRequested }
+    }
+
+    func setKeyPressed(_ v: Bool) {
+        state.withLock { $0.keyPressed = v }
+    }
+
+    var keyPressed: Bool {
+        state.withLock { $0.keyPressed }
+    }
+}
+
+/// Non-blocking, close-on-exec self-pipe for 100% POSIX async-signal-safe signal delivery.
+struct SignalPipe: Sendable {
+    let readFD: Int32
+    let writeFD: Int32
+
+    init() {
+        var fds: [Int32] = [-1, -1]
+        if Darwin.pipe(&fds) == 0 {
+            for fd in fds {
+                let fl = fcntl(fd, F_GETFD)
+                if fl >= 0 { _ = fcntl(fd, F_SETFD, fl | FD_CLOEXEC) }
+                let st = fcntl(fd, F_GETFL)
+                if st >= 0 { _ = fcntl(fd, F_SETFL, st | O_NONBLOCK) }
+            }
+            self.readFD = fds[0]
+            self.writeFD = fds[1]
+        } else {
+            self.readFD = -1
+            self.writeFD = -1
+        }
+    }
+}
+
+let signalPipe = SignalPipe()
+let runControl = RunController()
+
+func handleSigInt(_: Int32) {
+    let saved = errno
+    var b: UInt8 = 1
+    if signalPipe.writeFD >= 0 { _ = Darwin.write(signalPipe.writeFD, &b, 1) }
+    errno = saved
+}
+
+func handleSigTerm(_: Int32) {
+    let saved = errno
+    var b: UInt8 = 2
+    if signalPipe.writeFD >= 0 { _ = Darwin.write(signalPipe.writeFD, &b, 1) }
+    errno = saved
+}
+
+func startSignalWatcher() {
+    guard signalPipe.readFD >= 0 else { return }
+    let th = Thread {
+        var b: UInt8 = 0
+        var pfd = pollfd(fd: signalPipe.readFD, events: Int16(POLLIN), revents: 0)
+        while true {
+            let pr = Darwin.poll(&pfd, 1, -1)
+            if pr < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            while Darwin.read(signalPipe.readFD, &b, 1) == 1 {
+                if b == 1 {
+                    runControl.requestEnd()
+                } else {
+                    runControl.requestHardStop()
+                }
+            }
+        }
+    }
+    th.qualityOfService = .userInteractive
+    th.start()
+}
+
+func requestEnd() { runControl.requestEnd() }
+func interrupted() -> Bool { runControl.interrupted }
+
+// MARK: - Mach monotonic clock
+
+let ticksPerSecond: Double = {
+    var tb = mach_timebase_info_data_t()
+    guard mach_timebase_info(&tb) == KERN_SUCCESS, tb.numer > 0, tb.denom > 0 else {
+        return 1e9
+    }
+    return 1e9 * Double(tb.denom) / Double(tb.numer)
+}()
+let t0 = mach_absolute_time()
+func now() -> Double {
+    let cur = mach_absolute_time()
+    return cur >= t0 ? Double(cur - t0) / ticksPerSecond : 0.0
+}
+
+/// Computes `start + seconds` in Mach ticks without risking `UInt64(NaN/Inf/<0)` or overflow traps.
+@inline(__always)
+func deadlineTicks(from start: UInt64, after seconds: Double) -> UInt64 {
+    guard seconds.isFinite, seconds > 0 else { return start }
+    let bounded = min(seconds, 3600.0)
+    let scaled = bounded * ticksPerSecond
+    guard scaled.isFinite, scaled >= 0, scaled < Double(UInt64.max / 2) else { return start }
+    let (res, overflow) = start.addingReportingOverflow(UInt64(scaled))
+    return overflow ? UInt64.max : res
+}
+
+/// Waits for a moment on the clock: sleeps in <=20 ms interruptible slices, and spins only for the
+/// last ~1.5 ms (keeps timing tight without pinning a CPU core or stalling Ctrl-C / skip).
+func waitUntil(_ t: UInt64, allowSkip: Bool = true) {
+    let margin = UInt64(max(1.0, 0.0015 * ticksPerSecond))
+    while !(allowSkip ? runControl.interrupted : runControl.stopRequested) {
+        let n = mach_absolute_time()
+        if n >= t { return }
+        let rem = t - n
+        if rem > margin {
+            let sleepSec = Double(rem - margin) / ticksPerSecond
+            if sleepSec.isFinite && sleepSec > 0 {
+                let us = min(20_000.0, sleepSec * 1e6)
+                if us >= 1.0 { usleep(useconds_t(us)) }
+            }
+        }
+    }
+}
+
 func pause(_ seconds: Double) {
-    let end = now() + seconds
+    guard seconds.isFinite, seconds > 0 else { return }
+    let end = now() + min(seconds, 3600.0)
     while now() < end && !interrupted() { usleep(5000) }
 }
 
 /// Stops with a plain explanation: a headline, then what happened and what to do, indented.
 func fail(_ message: String, headline: String = "nospeaker can't play on this Mac.", code: Int32 = 1) -> Never {
+    stopRenderer()
     restoreTerminal()
+    stopTouch()
+    motorRuntime.closeMotor()
     let body = message.split(separator: "\n", omittingEmptySubsequences: false).map { "  " + $0 }.joined(separator: "\n")
     FileHandle.standardError.write(("\n  " + headline + "\n\n" + body + "\n\n").data(using: .utf8)!)
     exit(code)
@@ -68,51 +268,83 @@ func usageError(_ message: String) -> Never {
 
 // MARK: - The haptic motor (MultitouchSupport, resolved at run time)
 
-let mt = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW)
-func sym<T>(_ name: String, _: T.Type) -> T? {
-    guard let mt, let p = dlsym(mt, name) else { return nil }
-    return unsafeBitCast(p, to: T.self)
-}
-
 typealias CreateList = @convention(c) () -> Unmanaged<CFArray>?
 typealias GetID = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<UInt64>) -> Int32
 typealias IsBuiltIn = @convention(c) (UnsafeMutableRawPointer) -> Bool
 typealias ActuatorCreate = @convention(c) (UInt64) -> Unmanaged<CFTypeRef>?
 typealias ActuatorOpen = @convention(c) (CFTypeRef) -> Int32
 typealias ActuatorClose = @convention(c) (CFTypeRef) -> Int32
-typealias ActuationCreate = @convention(c) (CFDictionary, Int32) -> UnsafeMutableRawPointer?
-typealias ActuationPlay = @convention(c) (UnsafeMutableRawPointer, UnsafeMutableRawPointer, UInt32, Float, Float) -> Int32
+typealias ActuationCreate = @convention(c) (CFDictionary, Int32) -> Unmanaged<CFTypeRef>?
+typealias ActuationPlay = @convention(c) (CFTypeRef, CFTypeRef, UInt32, Float, Float) -> Int32
 typealias FrameCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Int32
 typealias RegisterCallback = @convention(c) (UnsafeMutableRawPointer, FrameCallback) -> Void
 typealias DeviceStart = @convention(c) (UnsafeMutableRawPointer, Int32) -> Void
 typealias DeviceStop = @convention(c) (UnsafeMutableRawPointer) -> Void
 
-let createList = sym("MTDeviceCreateList", CreateList.self)
-let getID = sym("MTDeviceGetDeviceID", GetID.self)
-let isBuiltIn = sym("MTDeviceIsBuiltIn", IsBuiltIn.self)
-let actuatorCreate = sym("MTActuatorCreateFromDeviceID", ActuatorCreate.self)
-let actuatorOpen = sym("MTActuatorOpen", ActuatorOpen.self)
-let actuatorClose = sym("MTActuatorClose", ActuatorClose.self)
-let actuationCreate = sym("MTActuationCreateFromDictionary", ActuationCreate.self)
-let actuationPlay = sym("MTActuationActuate", ActuationPlay.self)
-let registerCallback = sym("MTRegisterContactFrameCallback", RegisterCallback.self)
-let deviceStart = sym("MTDeviceStart", DeviceStart.self)
-let deviceStop = sym("MTDeviceStop", DeviceStop.self)
+struct MultitouchAPI: @unchecked Sendable {
+    let handle: UnsafeMutableRawPointer?
+    let createList: CreateList?
+    let getID: GetID?
+    let isBuiltIn: IsBuiltIn?
+    let actuatorCreate: ActuatorCreate?
+    let actuatorOpen: ActuatorOpen?
+    let actuatorClose: ActuatorClose?
+    let actuationCreate: ActuationCreate?
+    let actuationPlay: ActuationPlay?
+    let registerCallback: RegisterCallback?
+    let unregisterCallback: RegisterCallback?
+    let deviceStart: DeviceStart?
+    let deviceStop: DeviceStop?
 
-var deviceCount = 0
-var motorDeviceID: UInt64 = 0
-var motorBuiltIn = false
-var deviceList: CFArray?
+    init() {
+        let h = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW)
+        self.handle = h
+        func resolve<T>(_ name: String, _: T.Type) -> T? {
+            guard let h, let p = dlsym(h, name) else { return nil }
+            return unsafeBitCast(p, to: T.self)
+        }
+        self.createList = resolve("MTDeviceCreateList", CreateList.self)
+        self.getID = resolve("MTDeviceGetDeviceID", GetID.self)
+        self.isBuiltIn = resolve("MTDeviceIsBuiltIn", IsBuiltIn.self)
+        self.actuatorCreate = resolve("MTActuatorCreateFromDeviceID", ActuatorCreate.self)
+        self.actuatorOpen = resolve("MTActuatorOpen", ActuatorOpen.self)
+        self.actuatorClose = resolve("MTActuatorClose", ActuatorClose.self)
+        self.actuationCreate = resolve("MTActuationCreateFromDictionary", ActuationCreate.self)
+        self.actuationPlay = resolve("MTActuationActuate", ActuationPlay.self)
+        self.registerCallback = resolve("MTRegisterContactFrameCallback", RegisterCallback.self)
+        self.unregisterCallback = resolve("MTUnregisterContactFrameCallback", RegisterCallback.self)
+        self.deviceStart = resolve("MTDeviceStart", DeviceStart.self)
+        self.deviceStop = resolve("MTDeviceStop", DeviceStop.self)
+    }
+}
 
-/// The Mac's model identifier, like "MacBookPro18,3" or "Mac14,3".
+let mtAPI = MultitouchAPI()
+
+/// The Mac's model identifier, like "MacBookPro18,3" or "Mac14,3", read with a NUL-guarded buffer.
 func macModel() -> String {
     var size = 0
-    sysctlbyname("hw.model", nil, &size, nil, 0)
-    var buf = [CChar](repeating: 0, count: max(1, size))
-    sysctlbyname("hw.model", &buf, &size, nil, 0)
-    return String(cString: buf)
+    guard sysctlbyname("hw.model", nil, &size, nil, 0) == 0, size > 0, size <= 256 else {
+        return ""
+    }
+    var buf = [UInt8](repeating: 0, count: size + 1)
+    var outSize = size
+    let rc = buf.withUnsafeMutableBytes { raw -> Int32 in
+        guard let base = raw.baseAddress else { return -1 }
+        return sysctlbyname("hw.model", base, &outSize, nil, 0)
+    }
+    guard rc == 0 else { return "" }
+    let prefix = buf.prefix(while: { $0 != 0 })
+    return String(decoding: prefix, as: UTF8.self)
 }
-let isLaptop = macModel().hasPrefix("MacBook") || IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery")) != 0
+
+func hasSmartBattery() -> Bool {
+    let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+    guard svc != IO_OBJECT_NULL else { return false }
+    IOObjectRelease(svc)
+    return true
+}
+
+let isLaptop = macModel().hasPrefix("MacBook") || hasSmartBattery()
 
 /// Explains, in plain words, why there's no trackpad to play, and what would fix it.
 func noTrackpad(_ found: Bool) -> Never {
@@ -133,48 +365,122 @@ func noTrackpad(_ found: Bool) -> Never {
     fail(message)
 }
 
-func openMotor() -> CFTypeRef {
-    guard let createList, let getID, let actuatorCreate, let actuatorOpen, actuationCreate != nil, actuationPlay != nil else {
-        fail("This version of macOS doesn't have the trackpad functions this needs. It was made for macOS 12 to 27.")
+
+final class MotorRuntime: @unchecked Sendable {
+    struct State {
+        var deviceCount = 0
+        var motorDeviceID: UInt64 = 0
+        var motorBuiltIn = false
+        var deviceList: CFArray?
+        var motor: CFTypeRef?
+        var touchActive = false
     }
-    guard let list = createList()?.takeRetainedValue(), CFArrayGetCount(list) > 0 else { noTrackpad(false) }
-    deviceList = list
-    var ids: [(id: UInt64, builtIn: Bool)] = []
-    for i in 0..<CFArrayGetCount(list) {
-        guard let raw = CFArrayGetValueAtIndex(list, i) else { continue }
-        let dev = UnsafeMutableRawPointer(mutating: raw)
-        var id: UInt64 = 0
-        if getID(dev, &id) == 0 { ids.append((id, isBuiltIn?(dev) ?? false)) }
+    private let state = HeapUnfairLock(State())
+
+    var motorBuiltIn: Bool { state.withLock { $0.motorBuiltIn } }
+
+    func open() {
+        guard let createList = mtAPI.createList,
+              let getID = mtAPI.getID,
+              let actuatorCreate = mtAPI.actuatorCreate,
+              let actuatorOpen = mtAPI.actuatorOpen,
+              mtAPI.actuationCreate != nil,
+              mtAPI.actuationPlay != nil else {
+            fail("This version of macOS doesn't have the trackpad functions this needs. It was made for macOS 12 to 27.")
+        }
+        guard let list = createList()?.takeRetainedValue(), CFArrayGetCount(list) > 0 else {
+            noTrackpad(false)
+        }
+        var ids: [(id: UInt64, builtIn: Bool)] = []
+        for i in 0..<CFArrayGetCount(list) {
+            guard let raw = CFArrayGetValueAtIndex(list, i) else { continue }
+            let dev = UnsafeMutableRawPointer(mutating: raw)
+            var id: UInt64 = 0
+            if getID(dev, &id) == 0 {
+                ids.append((id, mtAPI.isBuiltIn?(dev) ?? false))
+            }
+        }
+        for d in ids.sorted(by: { $0.builtIn && !$1.builtIn }) {
+            if let ref = actuatorCreate(d.id)?.takeRetainedValue(), actuatorOpen(ref) == 0 {
+                state.withLock { s in
+                    s.deviceList = list
+                    s.deviceCount = ids.count
+                    s.motorDeviceID = d.id
+                    s.motorBuiltIn = d.builtIn
+                    s.motor = ref
+                }
+                return
+            }
+        }
+        noTrackpad(true)
     }
-    deviceCount = ids.count
-    for d in ids.sorted(by: { $0.builtIn && !$1.builtIn }) {
-        if let ref = actuatorCreate(d.id)?.takeRetainedValue(), actuatorOpen(ref) == 0 {
-            motorDeviceID = d.id
-            motorBuiltIn = d.builtIn
-            return ref
+
+    func activeMotor() -> CFTypeRef? {
+        state.withLock { $0.motor }
+    }
+
+    func matchingTouchDevices() -> [UnsafeMutableRawPointer] {
+        state.withLock { s in
+            guard let list = s.deviceList, let getID = mtAPI.getID else { return [] }
+            let wanted = s.motorDeviceID
+            return (0..<CFArrayGetCount(list)).compactMap { i -> UnsafeMutableRawPointer? in
+                guard let raw = CFArrayGetValueAtIndex(list, i) else { return nil }
+                let dev = UnsafeMutableRawPointer(mutating: raw)
+                var id: UInt64 = 0
+                return getID(dev, &id) == 0 && id == wanted ? dev : nil
+            }
         }
     }
-    noTrackpad(true)
+
+    func setTouchActive(_ active: Bool) -> Bool {
+        state.withLock { s in
+            let prev = s.touchActive
+            s.touchActive = active
+            return prev
+        }
+    }
+
+    func closeMotor() {
+        let oldMotor: CFTypeRef? = state.withLock { s in
+            let m = s.motor
+            s.motor = nil
+            s.deviceList = nil
+            return m
+        }
+        if let oldMotor {
+            _ = mtAPI.actuatorClose?(oldMotor)
+        }
+    }
 }
 
-var motor: CFTypeRef?
-var motorPointer: UnsafeMutableRawPointer?
+let motorRuntime = MotorRuntime()
+
 
 /// Plays tones (Hz, relative strength) together for `ms` at overall `level` (0…1). Strengths are scaled to
 /// add up to 1: past that is louder, but the driver starts stalling on long runs.
 func play(_ tones: [(hz: Double, amp: Double)], ms: Double, level: Float) {
-    guard let motorPointer, !tones.isEmpty else { return }
+    guard let motor = motorRuntime.activeMotor(),
+          let actuationCreate = mtAPI.actuationCreate,
+          let actuationPlay = mtAPI.actuationPlay,
+          !tones.isEmpty else { return }
     let sum = max(tones.reduce(0) { $0 + $1.amp }, 0.0001)
     let shape: [String: Any] = [
         "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": ms],
         "Tones": tones.map { ["Type": "Sine", "Amplitude": $0.amp / sum, "DurationMS": ms, "DelayMS": 0.0, "FrequencykHz": $0.hz / 1000] },
     ]
-    guard let act = actuationCreate!(shape as CFDictionary, 0) else { return }
-    _ = actuationPlay!(act, motorPointer, 0, min(1, max(0, level)), 0)
-    Unmanaged<AnyObject>.fromOpaque(act).release()
+    // Balanced CoreFoundation Create-rule ownership via ARC (`takeRetainedValue()`).
+    guard let act = actuationCreate(shape as CFDictionary, 0)?.takeRetainedValue() else { return }
+    let clampedLevel = min(1, max(0, level))
+    _ = withExtendedLifetime(motor) {
+        actuationPlay(act, motor, 0, clampedLevel, 0)
+    }
     let first = tones[0].hz
+    let playTime = now()
     live {
-        $0.actuations += 1; $0.hz = first; $0.level = Double(level); $0.lastPlay = now()
+        if $0.actuations < Int.max { $0.actuations += 1 }
+        $0.hz = first
+        $0.level = Double(clampedLevel)
+        $0.lastPlay = playTime
     }
 }
 
@@ -192,93 +498,147 @@ func greetingLine() -> String {
 
 /// True when the Mac's default output is muted or at zero volume; nil if it can't tell.
 func speakersMuted() -> Bool? {
-    var device = AudioDeviceID(0)
+    var device = AudioDeviceID(kAudioObjectUnknown)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
     var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
                                           mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &device) == noErr else { return nil }
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &device) == noErr,
+          size == UInt32(MemoryLayout<AudioDeviceID>.size),
+          device != kAudioObjectUnknown else { return nil }
+
     var known = false
-    var muted: UInt32 = 0
-    size = 4
-    addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-    if AudioObjectHasProperty(device, &addr), AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &muted) == noErr {
-        known = true
-        if muted != 0 { return true }
+
+    func readMute(_ element: AudioObjectPropertyElement) -> Bool? {
+        var muted: UInt32 = 0
+        var sz = UInt32(MemoryLayout<UInt32>.size)
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
+                                           mScope: kAudioObjectPropertyScopeOutput, mElement: element)
+        guard AudioObjectHasProperty(device, &a),
+              AudioObjectGetPropertyData(device, &a, 0, nil, &sz, &muted) == noErr,
+              sz == UInt32(MemoryLayout<UInt32>.size) else { return nil }
+        return muted != 0
     }
-    // Volume: the main element, else the first channel.
-    for element in [kAudioObjectPropertyElementMain, 1] {
-        var volume: Float32 = 1
-        size = 4
-        addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar, mScope: kAudioDevicePropertyScopeOutput, mElement: element)
-        if AudioObjectHasProperty(device, &addr), AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &volume) == noErr {
-            return volume < 0.001
+
+    if let masterMuted = readMute(kAudioObjectPropertyElementMain) {
+        known = true
+        if masterMuted { return true }
+    } else {
+        let chMutes = [AudioObjectPropertyElement(1), AudioObjectPropertyElement(2)].compactMap(readMute)
+        if !chMutes.isEmpty {
+            known = true
+            if chMutes.allSatisfy({ $0 }) { return true }
         }
+    }
+
+    func readVolume(_ element: AudioObjectPropertyElement) -> Float32? {
+        var volume: Float32 = 1
+        var sz = UInt32(MemoryLayout<Float32>.size)
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+                                           mScope: kAudioObjectPropertyScopeOutput, mElement: element)
+        guard AudioObjectHasProperty(device, &a),
+              AudioObjectGetPropertyData(device, &a, 0, nil, &sz, &volume) == noErr,
+              sz == UInt32(MemoryLayout<Float32>.size),
+              volume.isFinite else { return nil }
+        return volume
+    }
+
+    if let masterVol = readVolume(kAudioObjectPropertyElementMain) {
+        return masterVol < 0.001
+    }
+    let chVols = [AudioObjectPropertyElement(1), AudioObjectPropertyElement(2)].compactMap(readVolume)
+    if !chVols.isEmpty {
+        return chVols.allSatisfy { $0 < 0.001 }
     }
     return known ? false : nil
 }
 
 // MARK: - Touch (for "play it")
 
-struct Contact { var down = false; var x: Float = 0; var y: Float = 0; var size: Float = 0 }
-var touchLock = os_unfair_lock()
-var currentContact = Contact()
-var contact: Contact {
-    os_unfair_lock_lock(&touchLock); defer { os_unfair_lock_unlock(&touchLock) }
-    return currentContact
+struct Contact: Sendable {
+    var down = false
+    var x: Float = 0.5
+    var y: Float = 0.5
+    var size: Float = 0.0
 }
-let touchCallback: FrameCallback = { _, data, count, _, _ in
+
+let touchState = HeapUnfairLock(Contact())
+func currentContact() -> Contact { touchState.withLock { $0 } }
+
+func onTouchFrame(
+    _: UnsafeMutableRawPointer?,
+    _ data: UnsafeMutableRawPointer?,
+    _ count: Int32,
+    _: Double,
+    _: Int32
+) -> Int32 {
     var best = Contact()
-    if let data, count > 0 {
-        for i in 0..<Int(count) {
-            let rec = data.advanced(by: i * 96)
-            let state = rec.load(fromByteOffset: 20, as: Int32.self)
+    if let data, count > 0, count <= 32, Int(bitPattern: data) % 4 == 0 {
+        let rawBase = UnsafeRawPointer(data)
+        // Inspect at most 4 contacts: for all count >= 1 and idx < min(count, 4),
+        // idx * 96 + 52 <= count * 88, preventing OOB reads even on 88-byte MTTouch layouts.
+        let limit = min(Int(count), 4)
+        for i in 0..<limit {
+            let rec = rawBase.advanced(by: i * 96)
+            let state = rec.loadUnaligned(fromByteOffset: 20, as: Int32.self)
             guard (3...5).contains(state) else { continue }
-            best = Contact(down: true, x: rec.load(fromByteOffset: 32, as: Float.self),
-                           y: rec.load(fromByteOffset: 36, as: Float.self), size: rec.load(fromByteOffset: 48, as: Float.self))
+            let rawX = rec.loadUnaligned(fromByteOffset: 32, as: Float.self)
+            let rawY = rec.loadUnaligned(fromByteOffset: 36, as: Float.self)
+            let rawSize = rec.loadUnaligned(fromByteOffset: 48, as: Float.self)
+            guard rawX.isFinite, rawY.isFinite, rawSize.isFinite,
+                  rawX >= -0.25, rawX <= 1.25,
+                  rawY >= -0.25, rawY <= 1.25,
+                  rawSize >= 0.0, rawSize <= 10.0 else { continue }
+            best = Contact(
+                down: true,
+                x: min(1.0, max(0.0, rawX)),
+                y: min(1.0, max(0.0, rawY)),
+                size: min(4.0, max(0.0, rawSize))
+            )
         }
     }
-    os_unfair_lock_lock(&touchLock); currentContact = best; os_unfair_lock_unlock(&touchLock)
+    touchState.withLock { $0 = best }
     return 0
 }
-/// Only the trackpad whose motor we opened.
-func touchDevices() -> [UnsafeMutableRawPointer] {
-    guard let deviceList, let getID else { return [] }
-    return (0..<CFArrayGetCount(deviceList)).compactMap { i -> UnsafeMutableRawPointer? in
-        guard let raw = CFArrayGetValueAtIndex(deviceList, i) else { return nil }
-        let dev = UnsafeMutableRawPointer(mutating: raw)
-        var id: UInt64 = 0
-        return getID(dev, &id) == 0 && id == motorDeviceID ? dev : nil
-    }
-}
-let unregisterCallback = sym("MTUnregisterContactFrameCallback", RegisterCallback.self)
+
 func startTouch() -> Bool {
-    guard let registerCallback, let deviceStart else { return false }
-    let devs = touchDevices()
-    let quiet = !terminalTaken
+    guard let registerCallback = mtAPI.registerCallback, let deviceStart = mtAPI.deviceStart else { return false }
+    let devs = motorRuntime.matchingTouchDevices()
+    guard !devs.isEmpty else { return false }
+    _ = motorRuntime.setTouchActive(true)
+    let quiet = !isTerminalTaken()
     if quiet { silenceOthers() }
-    for d in devs { registerCallback(d, touchCallback); deviceStart(d, 0) }
+    for d in devs { registerCallback(d, onTouchFrame); deviceStart(d, 0) }
     if quiet { usleep(200_000); unsilence() }
-    return !devs.isEmpty
+    return true
 }
+
 func stopTouch() {
-    for d in touchDevices() {
-        unregisterCallback?(d, touchCallback)
-        deviceStop?(d)
+    guard motorRuntime.setTouchActive(false) else { return }
+    for d in motorRuntime.matchingTouchDevices() {
+        mtAPI.unregisterCallback?(d, onTouchFrame)
+        mtAPI.deviceStop?(d)
     }
+    touchState.withLock { $0 = Contact() }
 }
+
 
 // MARK: - Speech analysis
 
-struct Frame {
+struct Frame: Sendable {
     var formants: [Double] = [500, 1500, 2500]
     var amps: [Double] = [1, 0.5, 0.25]
     var level: Float = 0
     var voiced = false
     var f0 = 110.0
 }
+
+struct AppConfig: Sendable {
+    var voiceName: String?
+}
+
 let hop = 0.010
-let sampleRate = 16000.0
-var voiceName: String?
+let defaultSampleRate = 16000.0
+let appConfig = HeapUnfairLock(AppConfig())
 
 /// True if `say` has a voice by this name. (`say` quietly falls back to the default voice for unknown names.)
 func voiceExists(_ name: String) -> Bool {
@@ -297,18 +657,20 @@ func voiceExists(_ name: String) -> Bool {
 }
 
 func render(_ text: String) -> [Frame] {
+    if runControl.shouldSkipToCredits || runControl.stopRequested { return [] }
+    let configuredVoice = appConfig.withLock { $0.voiceName }
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("nospeaker-\(getpid()).wav")
     defer { try? FileManager.default.removeItem(at: url) }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-    p.arguments = ["-o", url.path, "--file-format=WAVE", "--data-format=LEF32@16000"] + (voiceName.map { ["-v", $0] } ?? []) + [text]
+    p.arguments = ["-o", url.path, "--file-format=WAVE", "--data-format=LEF32@16000"] + (configuredVoice.map { ["-v", $0] } ?? []) + [text]
     do { try p.run() } catch { fail("It couldn't run macOS's voice (/usr/bin/say), which it needs to talk.") }
     p.waitUntilExit()
     guard p.terminationStatus == 0, let file = try? AVAudioFile(forReading: url),
           let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
           (try? file.read(into: buf)) != nil, let ch = buf.floatChannelData?[0] else {
-        if let voiceName {
-            fail("There's no voice called \"\(voiceName)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.")
+        if let configuredVoice {
+            fail("There's no voice called \"\(configuredVoice)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.")
         }
         fail("macOS's voice (say) couldn't speak that line.", headline: "nospeaker couldn't prepare its voice.")
     }
@@ -338,7 +700,8 @@ func lpc(_ x: [Double], order p: Int) -> ([Double], Double) {
     return (a, e)
 }
 
-struct C {
+
+struct C: Sendable {
     var re: Double, im: Double
     static func + (l: C, r: C) -> C { C(re: l.re + r.re, im: l.im + r.im) }
     static func - (l: C, r: C) -> C { C(re: l.re - r.re, im: l.im - r.im) }
@@ -371,7 +734,7 @@ func roots(_ a: [Double]) -> [C] {
     return z
 }
 
-func analyse(_ x: [Float]) -> [Frame] {
+func analyse(_ x: [Float], sampleRate: Double = defaultSampleRate) -> [Frame] {
     let win = Int(0.025 * sampleRate), hopN = Int(hop * sampleRate), order = 18
     let hamming = (0..<win).map { 0.54 - 0.46 * cos(2 * .pi * Double($0) / Double(win - 1)) }
     var frames: [Frame] = [], rmsList: [Double] = []
@@ -447,9 +810,9 @@ func voiceTones(_ f: Frame) -> [(hz: Double, amp: Double)] {
 
 // MARK: - Live state shared with the screen
 
-enum Scene { case intro, heart, sweep, talk, sing, beat, rap, yourTurn, touch, say, outro }
+enum Scene: Sendable { case intro, heart, sweep, talk, sing, beat, rap, yourTurn, touch, say, outro }
 
-struct LiveState {
+struct LiveState: Sendable {
     var scene: Scene = .intro
     var part = 1
     var partName = "LOADING"
@@ -470,24 +833,29 @@ struct LiveState {
     var started = 0.0
     var stepDone = 0, stepTotal = 0
 }
-let liveLock = NSLock()
-var liveState = LiveState()
-func live(_ f: (inout LiveState) -> Void) { liveLock.lock(); f(&liveState); liveLock.unlock() }
-func snapshot() -> LiveState { liveLock.lock(); defer { liveLock.unlock() }; return liveState }
+
+let liveStore = HeapUnfairLock(LiveState())
+func live(_ f: (inout LiveState) -> Void) { liveStore.withLock(f) }
+func snapshot() -> LiveState { liveStore.withLock { $0 } }
 
 let partCount = 10
 /// Moves the show to a new part: what the screen draws, and the part number and name in the status bar.
 func enter(_ scene: Scene, _ part: Int, _ name: String) {
-    skipRequested = false
+    runControl.setSkipRequested(false)
     live { $0.scene = scene; $0.part = part; $0.partName = name }
 }
-func caption(_ text: String, seconds: Double) { live { $0.caption = text; $0.captionStart = now(); $0.captionDur = seconds } }
+func caption(_ text: String, seconds: Double) {
+    live { $0.caption = text; $0.captionStart = now(); $0.captionDur = seconds }
+}
 
 // MARK: - Notes
 
 func hz(_ note: String) -> Double {
     let names: [String: Int] = ["C": -9, "C#": -8, "D": -7, "D#": -6, "E": -5, "F": -4, "F#": -3, "G": -2, "G#": -1, "A": 0, "A#": 1, "B": 2]
-    guard let octave = Int(String(note.last!)), let semi = names[String(note.dropLast())] else { return 440 }
+    guard let lastChar = note.last,
+          let octave = Int(String(lastChar)),
+          (-1...9).contains(octave),
+          let semi = names[String(note.dropLast())] else { return 440 }
     return 440 * pow(2, Double(semi + (octave - 4) * 12) / 12)
 }
 
@@ -497,12 +865,12 @@ func hz(_ note: String) -> Double {
 func thump(_ amp: Double) {
     let start = mach_absolute_time()
     var t = 0.0
-    while t < 0.11 && !stopRequested {
+    while t < 0.11 && !runControl.stopRequested {
         let f = 120 + 780 * exp(-t / 0.02)
         let seg = 1 / f
         play([(f, 1)], ms: seg * 1000, level: Float(amp * exp(-t / 0.05)))
         t += seg
-        waitUntil(start + UInt64(t * ticksPerSecond))
+        waitUntil(deadlineTicks(from: start, after: t), allowSkip: false)
     }
 }
 
@@ -513,6 +881,7 @@ func heartbeat() {
 }
 
 func sweep(seconds: Double = 6) {
+    guard seconds.isFinite, seconds > 0 else { return }
     let start = mach_absolute_time()
     var t = 0.0
     while t < seconds && !interrupted() {
@@ -520,7 +889,7 @@ func sweep(seconds: Double = 6) {
         let seg = max(1, (0.02 * f).rounded()) / f
         play([(f, 1)], ms: seg * 1000, level: 1)
         t += seg
-        waitUntil(start + UInt64(t * ticksPerSecond))
+        waitUntil(deadlineTicks(from: start, after: t))
     }
 }
 
@@ -531,10 +900,11 @@ func talk(_ frames: [Frame], text: String) {
     let start = mach_absolute_time()
     var t = 0.0
     while t < total && !interrupted() {
-        let f = frames[min(frames.count - 1, Int(t / hop))]
+        let idx = max(0, min(frames.count - 1, Int((t / hop).rounded(.down))))
+        let f = frames[idx]
         var step = 0.005
         if f.level > 0 {
-            if f.voiced {
+            if f.voiced && f.f0.isFinite && f.f0 >= 40 {
                 step = 1 / f.f0
                 play(voiceTones(f), ms: step * 1000, level: f.level)
                 live { $0.f0 = f.f0; $0.f1 = f.formants[0]; $0.f2 = f.formants[1] }
@@ -544,7 +914,7 @@ func talk(_ frames: [Frame], text: String) {
             }
         }
         t += step
-        waitUntil(start + UInt64(t * ticksPerSecond))
+        waitUntil(deadlineTicks(from: start, after: t))
     }
     live { $0.f0 = 0; $0.f1 = 0; $0.f2 = 0 }
 }
@@ -577,12 +947,12 @@ func sing() {
             let seg = max(1, ((age < 0.06 ? 0.02 : 0.045) * f).rounded()) / f
             play([(f, 1)], ms: min(seg, at + sounding - t + 0.004) * 1000, level: Float(level))
             t += seg
-            waitUntil(start + UInt64(t * ticksPerSecond))
+            waitUntil(deadlineTicks(from: start, after: t))
         }
         previous = phraseEnds.contains(i) ? nil : target
         live { $0.noteRow = -1 }
         at += length
-        if t < at { t = at; waitUntil(start + UInt64(t * ticksPerSecond)) }
+        if t < at { t = at; waitUntil(deadlineTicks(from: start, after: t)) }
     }
 }
 
@@ -609,8 +979,9 @@ func groove(bars: Int, rapBar: Int, rap: [Frame], rapText: String) {
     var t = 0.0, next = 0, rapping = false
     var ringing: [Hit] = []
     let start = mach_absolute_time()
-    while t < end && !stopRequested {
-        if (skipRequested && !rapping) || jumpToCredits { break }
+    while t < end && !runControl.stopRequested {
+        if (runControl.skipRequested && !rapping) || runControl.shouldSkipToCredits { break }
+        if rapping && runControl.skipRequested { break }
         while next < hits.count, hits[next].t <= t + 0.0005 {
             let h = hits[next]
             ringing.append(h)
@@ -619,7 +990,7 @@ func groove(bars: Int, rapBar: Int, rap: [Frame], rapText: String) {
             next += 1
         }
         ringing.removeAll { t - $0.t > 0.2 }
-        let i16 = Int(t / s16)
+        let i16 = max(0, Int((t / s16).rounded(.down)))
         live { $0.step = i16 % 16; $0.bar = i16 / 16 }
         if !rapping, t >= rapStart {
             rapping = true
@@ -627,11 +998,14 @@ func groove(bars: Int, rapBar: Int, rap: [Frame], rapText: String) {
             caption(rapText, seconds: Double(rap.count) * hop)
         }
         var frame: Frame?
-        if t >= rapStart { let idx = Int((t - rapStart) / hop); if idx < rap.count { frame = rap[idx] } }
+        if t >= rapStart {
+            let idx = max(0, Int(((t - rapStart) / hop).rounded(.down)))
+            if idx < rap.count { frame = rap[idx] }
+        }
         let talking = (frame?.level ?? 0) > 0
         let bass = bassHz[(i16 / 16) % bassHz.count]
         var carrier = bass
-        if let f = frame, talking, f.voiced { carrier = f.f0 }
+        if let f = frame, talking, f.voiced, f.f0.isFinite, f.f0 >= 40 { carrier = f.f0 }
         var tones: [(hz: Double, amp: Double)] = []
         var step = 1 / carrier
         if let f = frame, talking {
@@ -675,7 +1049,7 @@ func groove(bars: Int, rapBar: Int, rap: [Frame], rapText: String) {
         let total = use.reduce(0) { $0 + $1.amp }
         if total > 0.01 { play(use, ms: step * 1000, level: Float(min(1, total))) }
         t += step
-        waitUntil(start + UInt64(t * ticksPerSecond))
+        waitUntil(deadlineTicks(from: start, after: t))
     }
     live { $0.step = -1; $0.f0 = 0; $0.f1 = 0; $0.f2 = 0 }
 }
@@ -687,72 +1061,86 @@ func touchToPlay() {
     defer { stopTouch() }
     live { $0.touchWaitUntil = now() + 8 }
     let waitEnd = now() + 8
-    while now() < waitEnd && !interrupted() && !contact.down { usleep(5000) }
-    guard contact.down else { live { $0.touchMissed = true }; pause(1.5); return }
+    while now() < waitEnd && !interrupted() && !currentContact().down { usleep(5000) }
+    guard currentContact().down else { live { $0.touchMissed = true }; pause(1.5); return }
     let endAt = now() + 12
     live { $0.touchSeen = true; $0.touchEnds = endAt }
     let scale = ["G5", "A5", "B5", "C6", "E6", "F6", "G6", "A6", "B6", "C7"].map(hz)
     var current = scale[4]
     var lastDown = false, downAt = 0.0
     while now() < endAt && !interrupted() {
-        let c = contact
-        live { $0.touchDown = c.down; if c.down { $0.touchX = Double(c.x); $0.touchY = Double(c.y) } }
+        let c = currentContact()
+        let safeX: Float = c.x.isFinite ? min(0.999999, max(0.0, c.x)) : 0.5
+        let safeY: Float = c.y.isFinite ? min(1.0, max(0.0, c.y)) : 0.5
+        let safeSize: Float = c.size.isFinite ? min(4.0, max(0.0, c.size)) : 0.0
+        live {
+            $0.touchDown = c.down
+            if c.down { $0.touchX = Double(safeX); $0.touchY = Double(safeY) }
+        }
         guard c.down else { lastDown = false; usleep(3000); continue }
         if !lastDown { downAt = now() }
         lastDown = true
-        let idx = min(scale.count - 1, max(0, Int((Double(c.x) * Double(scale.count)).rounded(.down))))
+        let idx = min(scale.count - 1, max(0, Int((Double(safeX) * Double(scale.count)).rounded(.down))))
         let target = scale[idx]
-        current *= pow(target / current, 0.3)
-        let age = now() - downAt
-        let depth = 0.05 + 0.45 * Double(max(0, min(1, c.y)))
+        let nextCur = current * pow(target / current, 0.3)
+        current = (nextCur.isFinite && nextCur >= 80 && nextCur <= 4200) ? nextCur : target
+        let age = max(0, now() - downAt)
+        let depth = 0.05 + 0.45 * Double(safeY)
         let f = current * pow(2, depth * sin(2 * .pi * 6 * age) / 12)
-        let level = min(1, max(0.5, 0.3 + Double(c.size) * 0.8))
+        let level = min(1, max(0.5, 0.3 + Double(safeSize) * 0.8))
         let seg = max(1, (0.02 * f).rounded()) / f
-        let t0 = mach_absolute_time()
+        let stepStart = mach_absolute_time()
         play([(f, 1)], ms: seg * 1000, level: Float(level))
         live { $0.noteName = noteName(f) }
-        waitUntil(t0 + UInt64(seg * ticksPerSecond))
+        waitUntil(deadlineTicks(from: stepStart, after: seg))
     }
     live { $0.touchDown = false }
 }
 
 func noteName(_ f: Double) -> String {
+    guard f.isFinite, f >= 20.0, f <= 20000.0 else { return "-" }
     let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     let midi = Int((69 + 12 * log2(f / 440)).rounded())
-    return names[(midi % 12 + 12) % 12] + String(midi / 12 - 1)
+    let noteIdx = ((midi % 12) + 12) % 12
+    let octave = Int(floor(Double(midi) / 12.0)) - 1
+    return names[noteIdx] + String(octave)
 }
 
 /// A sparkle to close: an arpeggio up, then the motor's purest note.
 func sparkle() {
-    for n in ["A5", "C6", "E6", "A6", "C7"] where !stopRequested {
+    for n in ["A5", "C6", "E6", "A6", "C7"] where !runControl.stopRequested {
         let f = hz(n)
         let seg = (0.07 * f).rounded() / f
+        let stepStart = mach_absolute_time()
         play([(f, 1)], ms: seg * 1000, level: 0.9)
-        let end = mach_absolute_time() + UInt64(seg * ticksPerSecond)
-        waitUntil(end)
+        waitUntil(deadlineTicks(from: stepStart, after: seg), allowSkip: false)
     }
     let start = mach_absolute_time()
     var t = 0.0
-    while t < 0.6 && !stopRequested {
+    while t < 0.6 && !runControl.stopRequested {
         let seg = (0.02 * 3951).rounded() / 3951
         play([(3951, 1)], ms: seg * 1000, level: Float(exp(-t / 0.18)))
         t += seg
-        waitUntil(start + UInt64(t * ticksPerSecond))
+        waitUntil(deadlineTicks(from: start, after: t), allowSkip: false)
     }
 }
 
 /// Lines to try in Say anything, shown one at a time in the empty box. Tab types the one showing.
 let saySuggestions = ["can you hear me?", "please stop clicking me", "this is not a speaker", "nobody believes me",
                       "i live under the glass", "hello from the trackpad"]
-func saySuggestion(at t: Double) -> String { saySuggestions[Int(t / 3) % saySuggestions.count] }
+func saySuggestion(at t: Double) -> String {
+    guard t.isFinite, t >= 0 else { return saySuggestions[0] }
+    let slot = Int((t / 3.0).truncatingRemainder(dividingBy: Double(saySuggestions.count)))
+    return saySuggestions[((slot % saySuggestions.count) + saySuggestions.count) % saySuggestions.count]
+}
 
 /// Say anything: you type a line and the trackpad says it. Up to five lines; return on an empty line or esc
 /// goes to the credits, and so do 25 seconds without typing.
 func sayAnything() {
-    for _ in 0..<5 where !stopRequested && !jumpToCredits {
+    for _ in 0..<5 where !runControl.shouldSkipToCredits {
         live { $0.inputActive = true; $0.inputText = ""; $0.inputSubmitted = false; $0.sayStatus = "typing"; $0.caption = "" }
         var lastChange = now(), lastText = ""
-        while !stopRequested && !jumpToCredits {
+        while !runControl.shouldSkipToCredits {
             let st = snapshot()
             if st.inputSubmitted || st.inputDone { break }
             if st.inputText != lastText { lastText = st.inputText; lastChange = now() }
@@ -762,9 +1150,10 @@ func sayAnything() {
         let st = snapshot()
         live { $0.inputActive = false }
         let text = st.inputText.trimmingCharacters(in: .whitespaces)
-        if st.inputDone || text.isEmpty || stopRequested || jumpToCredits { break }
+        if st.inputDone || text.isEmpty || runControl.shouldSkipToCredits { break }
         live { $0.sayStatus = "preparing" }
         let frames = render(text)
+        if runControl.shouldSkipToCredits { break }
         live { $0.sayStatus = "speaking"; $0.sayCount += 1 }
         talk(frames, text: text)
         pause(0.6)
@@ -774,106 +1163,135 @@ func sayAnything() {
 
 // MARK: - Terminal
 
-var savedTermios = termios()
-var terminalTaken = false
-/// Where the show draws. While it runs, stdout and stderr point at /dev/null, because MultitouchSupport
-/// prints its own debug lines ("Recognized family…") when touch tracking starts.
-var outFD = STDOUT_FILENO
-var savedOut: Int32 = -1, savedErr: Int32 = -1
+struct LegacyTerminalState: Sendable {
+    var savedTermios = termios()
+    var terminalTaken = false
+    var outFD: Int32 = STDOUT_FILENO
+    var savedOut: Int32 = -1
+    var savedErr: Int32 = -1
+}
+
+let legacyTerm = HeapUnfairLock(LegacyTerminalState())
+func isTerminalTaken() -> Bool { legacyTerm.withLock { $0.terminalTaken } }
+
 func silenceOthers() {
-    fflush(stdout); fflush(stderr)
-    savedOut = dup(STDOUT_FILENO); savedErr = dup(STDERR_FILENO)
-    outFD = savedOut
-    let null = open("/dev/null", O_WRONLY)
-    dup2(null, STDOUT_FILENO); dup2(null, STDERR_FILENO); close(null)
+    legacyTerm.withLock { s in
+        fflush(stdout); fflush(stderr)
+        s.savedOut = dup(STDOUT_FILENO); s.savedErr = dup(STDERR_FILENO)
+        s.outFD = s.savedOut
+        let null = open("/dev/null", O_WRONLY)
+        dup2(null, STDOUT_FILENO); dup2(null, STDERR_FILENO); close(null)
+    }
 }
 func unsilence() {
-    guard savedOut >= 0 else { return }
-    fflush(stdout); fflush(stderr)
-    dup2(savedOut, STDOUT_FILENO); dup2(savedErr, STDERR_FILENO)
-    close(savedOut); close(savedErr)
-    savedOut = -1; savedErr = -1; outFD = STDOUT_FILENO
+    legacyTerm.withLock { s in
+        guard s.savedOut >= 0 else { return }
+        fflush(stdout); fflush(stderr)
+        dup2(s.savedOut, STDOUT_FILENO); dup2(s.savedErr, STDERR_FILENO)
+        close(s.savedOut); close(s.savedErr)
+        s.savedOut = -1; s.savedErr = -1; s.outFD = STDOUT_FILENO
+    }
 }
 func out(_ s: String) {
+    let fd = legacyTerm.withLock { $0.outFD }
     let bytes = Array(s.utf8)
     let count = bytes.count
     bytes.withUnsafeBytes { buf in
+        guard let base = buf.baseAddress else { return }
         var off = 0
         while off < count {
-            let n = write(outFD, buf.baseAddress! + off, count - off)
+            let n = write(fd, base + off, count - off)
             if n <= 0 { break }
             off += n
         }
     }
 }
 func takeTerminal() {
-    terminalTaken = true
+    legacyTerm.withLock { s in
+        s.terminalTaken = true
+        tcgetattr(STDIN_FILENO, &s.savedTermios)
+        var t = s.savedTermios
+        t.c_lflag &= ~tcflag_t(ICANON | ECHO)
+        tcsetattr(STDIN_FILENO, TCSANOW, &t)
+    }
     silenceOthers()
-    tcgetattr(STDIN_FILENO, &savedTermios)
-    var t = savedTermios
-    t.c_lflag &= ~tcflag_t(ICANON | ECHO)
-    tcsetattr(STDIN_FILENO, TCSANOW, &t)
     out("\u{1B}[?1049h\u{1B}[?25l\u{1B}[?1000h\u{1B}[?1002h\u{1B}[?1006h" + fillScreen())
 }
 func restoreTerminal() {
-    guard terminalTaken else { return }
-    terminalTaken = false
+    let savedOpt: termios? = legacyTerm.withLock { s in
+        guard s.terminalTaken else { return nil }
+        s.terminalTaken = false
+        return s.savedTermios
+    }
+    guard var saved = savedOpt else { return }
     out("\u{1B}[?1006l\u{1B}[?1002l\u{1B}[?1000l\u{1B}[0m\u{1B}[2J\u{1B}[?25h\u{1B}[?1049l")
     unsilence()
-    tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
+    tcsetattr(STDIN_FILENO, TCSANOW, &saved)
+}
+func onExitRestore() {
+    stopRenderer()
+    restoreTerminal()
+    unsilence()
 }
 /// Paints the whole terminal in the theme's background (not just the show's 80×24 block), so the show sits
 /// centred on one page however big the window is.
 func fillScreen() -> String {
     let size = terminalSize()
+    let bg = themeStore.withLock { $0.screenBackground }
     let row = String(repeating: " ", count: size.w)
-    var s = "\u{1B}[0m" + screenBackground + "\u{1B}[2J"
+    var s = "\u{1B}[0m" + bg + "\u{1B}[2J"
     for y in 0..<size.h { s += "\u{1B}[\(y + 1);1H" + row }
     return s
 }
 
 func terminalSize() -> (w: Int, h: Int) {
+    let fd = legacyTerm.withLock { $0.outFD }
     var ws = winsize()
-    if ioctl(outFD, TIOCGWINSZ, &ws) == 0, ws.ws_col > 0 { return (Int(ws.ws_col), Int(ws.ws_row)) }
+    if ioctl(fd, TIOCGWINSZ, &ws) == 0, ws.ws_col > 0 { return (Int(ws.ws_col), Int(ws.ws_row)) }
     return (80, 24)
 }
 
-struct Cell: Equatable { var ch: Character = " "; var fg: UInt8 = 250; var bg: UInt8 = 16; var bold = false }
+struct Cell: Equatable, Sendable { var ch: Character = " "; var fg: UInt8 = 250; var bg: UInt8 = 16; var bold = false }
 
-/// Colours are chosen as xterm 256-colour indexes but sent as exact 24-bit RGB, so a terminal's own theme
-/// (light themes remap the palette) can't change them: black stays black.
-var rgbTable: [String] = (0..<256).map { n -> String in
-    let v: (Int, Int, Int)
-    if n < 16 {
-        let base = [(0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
-                    (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)]
-        v = base[n]
-    } else if n >= 232 {
-        let g = 8 + (n - 232) * 10
-        v = (g, g, g)
-    } else {
-        let c = n - 16
-        let f = { (x: Int) in x == 0 ? 0 : 55 + x * 40 }
-        v = (f(c / 36), f((c / 6) % 6), f(c % 6))
+struct ThemePalette: Sendable {
+    var rgbTable: [String] = (0..<256).map { n -> String in
+        let v: (Int, Int, Int)
+        if n < 16 {
+            let base = [(0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
+                        (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)]
+            v = base[n]
+        } else if n >= 232 {
+            let g = 8 + (n - 232) * 10
+            v = (g, g, g)
+        } else {
+            let c = n - 16
+            let f = { (x: Int) in x == 0 ? 0 : 55 + x * 40 }
+            v = (f(c / 36), f((c / 6) % 6), f(c % 6))
+        }
+        return "\(v.0);\(v.1);\(v.2)"
     }
-    return "\(v.0);\(v.1);\(v.2)"
+    var screenBackground = "\u{1B}[48;2;0;0;0m"
+    var lightTheme = false
 }
-var screenBackground = "\u{1B}[48;2;0;0;0m"
-var lightTheme = false
+
+let themeStore = HeapUnfairLock(ThemePalette())
 
 /// Mono: black on off-white (default), or `--dark` for white on black. Greys run between the two.
 func applyTheme(light: Bool) {
-    lightTheme = light
-    let paper = light ? (246, 245, 241) : (0, 0, 0)
-    let ink = light ? (12, 12, 12) : (255, 255, 255)
-    func str(_ c: (Int, Int, Int)) -> String { "\(c.0);\(c.1);\(c.2)" }
-    func mix(_ u: Double) -> (Int, Int, Int) {
-        (Int(Double(paper.0) + Double(ink.0 - paper.0) * u), Int(Double(paper.1) + Double(ink.1 - paper.1) * u),
-         Int(Double(paper.2) + Double(ink.2 - paper.2) * u))
+    themeStore.withLock { theme in
+        theme.lightTheme = light
+        let paper = light ? (246, 245, 241) : (0, 0, 0)
+        let ink = light ? (12, 12, 12) : (255, 255, 255)
+        func str(_ c: (Int, Int, Int)) -> String { "\(c.0);\(c.1);\(c.2)" }
+        func mix(_ u: Double) -> (Int, Int, Int) {
+            (Int(Double(paper.0) + Double(ink.0 - paper.0) * u),
+             Int(Double(paper.1) + Double(ink.1 - paper.1) * u),
+             Int(Double(paper.2) + Double(ink.2 - paper.2) * u))
+        }
+        for n in 232...255 { theme.rgbTable[n] = str(mix(0.05 + 0.95 * Double(n - 232) / 23)) }
+        theme.rgbTable[16] = str(paper)
+        theme.screenBackground = "\u{1B}[48;2;\(str(paper))m"
     }
-    for n in 232...255 { rgbTable[n] = str(mix(0.05 + 0.95 * Double(n - 232) / 23)) }
-    rgbTable[16] = str(paper)
-    screenBackground = "\u{1B}[48;2;\(str(paper))m"
 }
 
 final class Canvas {
@@ -891,7 +1309,7 @@ final class Canvas {
     func centered(_ y: Int, _ s: String, _ fg: UInt8, bold: Bool = false) { text((w - s.count) / 2, y, s, fg, bold: bold) }
     /// What the terminal is showing now, to send only the cells that changed.
     var shown: [Cell]?
-    func changes(originX: Int, originY: Int) -> String {
+    func changes(originX: Int, originY: Int, rgbTable: [String]) -> String {
         var s = ""
         var pen: Cell?
         var writeAt = -1
@@ -909,7 +1327,6 @@ final class Canvas {
         shown = cells
         return s.isEmpty ? "" : s + "\u{1B}[0m"
     }
-
 }
 
 // MARK: - Look
@@ -984,15 +1401,25 @@ func shimmer(_ i: Int) -> UInt8 { silver[((i % silver.count) + silver.count) % s
 
 let scrollText = "      ·  a90.com presents  NO SPEAKER  ·    the trackpad has no speaker. every sound you hear is its haptic motor, driven through MultitouchSupport, a private macOS framework.    range: 100 to 4000 vibrations per second.    voice: two formants, retriggered on every pitch beat.    thanks for listening.    a90.com    "
 
-// Screen memory owned by the render thread.
-var rollHistory = [Int](repeating: -1, count: 62)
-var trail: [(x: Double, y: Double)] = []
-func remember(_ s: LiveState, _ t: Double) {
-    rollHistory.removeFirst(); rollHistory.append(s.scene == .sing && t - s.lastPlay < 0.1 ? s.noteRow : -1)
-    if s.scene == .touch, s.touchDown { trail.append((s.touchX, s.touchY)); if trail.count > 14 { trail.removeFirst() } }
+
+let scrollChars = Array(scrollText)
+
+struct RenderMemory {
+    var rollHistory = [Int](repeating: -1, count: 62)
+    var trail: [(x: Double, y: Double)] = []
+    var marquee = 0
+
+    mutating func remember(_ s: LiveState, _ t: Double) {
+        rollHistory.removeFirst()
+        rollHistory.append(s.scene == .sing && t - s.lastPlay < 0.1 ? s.noteRow : -1)
+        if s.scene == .touch, s.touchDown {
+            trail.append((s.touchX, s.touchY))
+            if trail.count > 14 { trail.removeFirst() }
+        }
+    }
 }
 
-func draw(_ cv: Canvas, _ s: LiveState, _ t: Double) {
+func draw(_ cv: Canvas, _ s: LiveState, _ t: Double, _ mem: RenderMemory) {
     cv.clear()
     // "a90.com presents", framed by rules.
     let presents = "a90.com presents"
@@ -1008,10 +1435,10 @@ func draw(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     case .heart: drawHeart(cv, s, t)
     case .sweep: drawSweep(cv, s, t)
     case .talk: drawTalk(cv, s, t)
-    case .sing: drawSing(cv, s, t)
+    case .sing: drawSing(cv, s, t, rollHistory: mem.rollHistory)
     case .beat, .rap: drawBeat(cv, s, t)
     case .yourTurn: drawYourTurn(cv, s, t)
-    case .touch: drawTouch(cv, s, t)
+    case .touch: drawTouch(cv, s, t, trail: mem.trail)
     case .say: drawSay(cv, s, t)
     case .outro: drawOutro(cv, s, t)
     default: break
@@ -1032,10 +1459,9 @@ func draw(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     }
     cv.text(2, 22, "space skip · q end", faintC)
     // Scroller.
-    let chars = Array(scrollText)
     for x in 0..<80 {
-        let c = chars[(x + marquee) % chars.count]
-        cv.put(x, 23, c, shimmer((x + marquee) / 2), bold: true)
+        let c = scrollChars[(x + mem.marquee) % scrollChars.count]
+        cv.put(x, 23, c, shimmer((x + mem.marquee) / 2), bold: true)
     }
 }
 
@@ -1046,8 +1472,8 @@ func drawSplash(_ cv: Canvas, _ s: LiveState, _ t: Double) {
         let d = dots(label, value, width: 56)
         cv.text(x + 2, y, d, midC); cv.text(x + 2 + d.count, y, value, inkC, bold: true)
     }
-    if done >= 1 { line(12, "loading the trackpad's haptics", mt != nil ? "ok" : "missing") }
-    if done >= 2 { line(13, motorBuiltIn ? "connecting to the built-in trackpad" : "connecting to the trackpad", "ready") }
+    if done >= 1 { line(12, "loading the trackpad's haptics", mtAPI.handle != nil ? "ok" : "missing") }
+    if done >= 2 { line(13, motorRuntime.motorBuiltIn ? "connecting to the built-in trackpad" : "connecting to the trackpad", "ready") }
     if done >= 2 {
         let total = max(1, s.stepTotal - 2), voices = max(0, min(total, done - 2))
         if voices < total {
@@ -1151,7 +1577,7 @@ func drawTalk(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     cv.text(25, 20, "two tones, one motor, no speaker", midC)
 }
 
-func drawSing(_ cv: Canvas, _ s: LiveState, _ t: Double) {
+func drawSing(_ cv: Canvas, _ s: LiveState, _ t: Double, rollHistory: [Int]) {
     for (i, n) in rollNotes.enumerated() {
         let y = 10 + i
         cv.text(2, y, n, s.noteRow == i ? inkC : dimC, bold: s.noteRow == i)
@@ -1209,7 +1635,7 @@ func drawYourTurn(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     cv.centered(18, "in a moment you'll play it with your finger", midC)
 }
 
-func drawTouch(_ cv: Canvas, _ s: LiveState, _ t: Double) {
+func drawTouch(_ cv: Canvas, _ s: LiveState, _ t: Double, trail: [(x: Double, y: Double)]) {
     let x0 = 3, y0 = 10, w = 38, h = 11
     let edge: UInt8 = s.touchDown ? inkC : dimC
     cv.text(x0, y0, "╭" + String(repeating: "─", count: w - 2) + "╮", edge)
@@ -1310,43 +1736,89 @@ func drawOutro(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     }
 }
 
-var renderRunning = false
-/// The scroller's position: one character per step, stepped by the frame clock so every step is even.
-var marquee = 0
-var lastMutePoll = -9.0
+/// Deterministic join-barrier coordinator ensuring the render thread finishes its final
+/// `out(frame)` syscall strictly before `restoreTerminal()` closes `savedOut`.
+final class RendererLifecycleCoordinator: Sendable {
+    private let running = HeapUnfairLock<Bool>(false)
+    private let exitedSemaphore = DispatchSemaphore(value: 0)
+
+    func tryStart() -> Bool {
+        running.withLock { cur in
+            guard !cur else { return false }
+            cur = true
+            return true
+        }
+    }
+
+    var shouldContinue: Bool {
+        running.withLock { $0 }
+    }
+
+    func notifyLoopExited() {
+        exitedSemaphore.signal()
+    }
+
+    func stopAndJoin(timeoutSeconds: Double = 2.0) {
+        let wasRunning = running.withLock { cur -> Bool in
+            let prev = cur
+            cur = false
+            return prev
+        }
+        if wasRunning {
+            _ = exitedSemaphore.wait(timeout: .now() + timeoutSeconds)
+        }
+    }
+}
+
+let rendererLifecycle = RendererLifecycleCoordinator()
+
 func startRenderer() {
-    renderRunning = true
+    guard rendererLifecycle.tryStart() else { return }
     let th = Thread {
+        defer { rendererLifecycle.notifyLoopExited() }
         let cv = Canvas()
+        var mem = RenderMemory()
         var lastSize = (w: 0, h: 0)
-        var frameCount = 0
+        var lastMutePoll = -9.0
+        var frameCount: UInt64 = 0
         var next = now()
-        while renderRunning {
-            let t = now()
-            frameCount += 1
+        while rendererLifecycle.shouldContinue {
             let s = snapshot()
+            let t = max(now(), s.captionStart)
+            frameCount &+= 1
             // Screen memory: piano roll and touch trail.
-            remember(s, t)
+            mem.remember(s, t)
             if t - lastMutePoll > 0.5 { lastMutePoll = t; let m = speakersMuted(); live { $0.muted = m } }
             let size = terminalSize()
             var prefix = ""
             if size != lastSize { prefix = fillScreen(); lastSize = size; cv.shown = nil }
-            draw(cv, s, t)
-            let frame = prefix + cv.changes(originX: max(0, (size.w - 80) / 2), originY: max(0, (size.h - 24) / 2))
+            draw(cv, s, t, mem)
+            let rgb = themeStore.withLock { $0.rgbTable }
+            let diff = cv.changes(originX: max(0, (size.w - 80) / 2), originY: max(0, (size.h - 24) / 2), rgbTable: rgb)
+            let frame = prefix + diff
             if !frame.isEmpty { out(frame) }
             // A steady frame clock: 24 fps while playing (the scroller steps every other frame, 12 chars/s),
             // 8 fps while waiting on the credits (one step a frame).
             let period = s.waitingForKey ? 0.125 : 1.0 / 24
-            if s.waitingForKey || frameCount % 2 == 0 { marquee += 1 }
+            if s.waitingForKey || frameCount % 2 == 0 {
+                mem.marquee = (mem.marquee + 1) % scrollChars.count
+            }
             next += period
             let wait = next - now()
-            if wait > 0 { usleep(useconds_t(wait * 1e6)) } else { next = now() }
+            if wait.isFinite && wait > 0 {
+                let cappedUs = min(125_000.0, wait * 1e6)
+                if cappedUs >= 1.0 { usleep(useconds_t(cappedUs)) }
+            } else {
+                next = now()
+            }
         }
     }
     th.qualityOfService = .userInitiated
     th.start()
 }
-func stopRenderer() { renderRunning = false; usleep(60_000) }
+
+func stopRenderer() { rendererLifecycle.stopAndJoin() }
+
 
 /// True when a byte is ready on stdin within `ms` milliseconds.
 func waitForInput(ms: Int) -> Bool {
@@ -1357,7 +1829,7 @@ func waitForInput(ms: Int) -> Bool {
 func startKeys() {
     let th = Thread {
         var c: UInt8 = 0
-        while !stopRequested {
+        while !runControl.stopRequested {
             guard read(STDIN_FILENO, &c, 1) == 1 else { usleep(10_000); continue }
             // Typing a line for it to say: every key is text, except return, backspace, tab and esc.
             if snapshot().inputActive {
@@ -1406,9 +1878,9 @@ func startKeys() {
                 live { $0.followOpenedAt = at }
                 continue
             }
-            keyPressed = true
+            runControl.setKeyPressed(true)
             if c == UInt8(ascii: "q") || c == UInt8(ascii: "Q") { requestEnd() }
-            if c == UInt8(ascii: " ") || c == UInt8(ascii: "s") { skipRequested = true }
+            if c == UInt8(ascii: " ") || c == UInt8(ascii: "s") { runControl.setSkipRequested(true) }
         }
     }
     th.start()
@@ -1440,7 +1912,7 @@ func show(visuals: Bool) {
     progress(1, "connecting to the trackpad")
     pause(0.5)
     var voices: [String: [Frame]] = [:]
-    for (i, line) in phrases.enumerated() where !stopRequested {
+    for (i, line) in phrases.enumerated() where !runControl.shouldSkipToCredits {
         progress(2 + i, "preparing the voice \(i + 1)/\(phrases.count)")
         voices[line] = render(line)
     }
@@ -1451,40 +1923,38 @@ func show(visuals: Bool) {
         let holdUntil = now() + 15
         while speakersMuted() == false && !interrupted() && now() < holdUntil { usleep(100_000) }
         if speakersMuted() == true { live { $0.muted = true }; pause(1.2) }
-        skipRequested = false
+        runControl.setSkipRequested(false)
     }
 
     // 2. It wakes up: a heartbeat, no words yet.
-    if !stopRequested && !jumpToCredits { enter(.heart, 2, "WAKING UP"); pause(0.3); heartbeat() }
+    if !runControl.shouldSkipToCredits { enter(.heart, 2, "WAKING UP"); pause(0.3); heartbeat() }
     // 3. Its first words: hello, who it is, what it knows (the reveal).
-    if !stopRequested && !jumpToCredits { enter(.talk, 3, "FIRST WORDS"); say("“\(greeting)”"); pause(0.4); talk(voices[greeting]!, text: greeting); pause(0.9) }
+    if !runControl.shouldSkipToCredits { enter(.talk, 3, "FIRST WORDS"); say("“\(greeting)”"); pause(0.4); talk(voices[greeting] ?? [], text: greeting); pause(0.9) }
     // 4. How: the sweep.
-    if !stopRequested && !jumpToCredits { enter(.sweep, 4, "SWEEP"); say("sweep 100 Hz → 4 kHz"); pause(0.3); sweep(); pause(0.4) }
+    if !runControl.shouldSkipToCredits { enter(.sweep, 4, "SWEEP"); say("sweep 100 Hz → 4 kHz"); pause(0.3); sweep(); pause(0.4) }
     // 5. Melody.
-    if !stopRequested && !jumpToCredits { enter(.sing, 5, "MELODY"); say("♪ melody"); pause(0.4); sing(); pause(0.5) }
+    if !runControl.shouldSkipToCredits { enter(.sing, 5, "MELODY"); say("♪ melody"); pause(0.4); sing(); pause(0.5) }
     // 6. Beat, then the rap over it.
-    if !stopRequested && !jumpToCredits {
+    if !runControl.shouldSkipToCredits {
         enter(.beat, 6, "BEAT"); say("beat · then rap: “\(rapLine)”")
-        groove(bars: 4, rapBar: 2, rap: voices[rapLine]!, rapText: rapLine); pause(0.5)
+        groove(bars: 4, rapBar: 2, rap: voices[rapLine] ?? [], rapText: rapLine); pause(0.5)
     }
     // 7. Your turn.
-    if !stopRequested && !jumpToCredits { enter(.yourTurn, 7, "YOUR TURN"); say("“\(turnLine)”"); pause(0.3); talk(voices[turnLine]!, text: turnLine); pause(0.4) }
+    if !runControl.shouldSkipToCredits { enter(.yourTurn, 7, "YOUR TURN"); say("“\(turnLine)”"); pause(0.3); talk(voices[turnLine] ?? [], text: turnLine); pause(0.4) }
     // 8. Touch to play.
-    if !stopRequested && !jumpToCredits { enter(.touch, 8, "TOUCH TO PLAY"); say("touch the trackpad: slide for pitch (12 s)"); touchToPlay() }
+    if !runControl.shouldSkipToCredits { enter(.touch, 8, "TOUCH TO PLAY"); say("touch the trackpad: slide for pitch (12 s)"); touchToPlay() }
     // 9. Say anything (only with the screen: it needs typing).
-    if !stopRequested && !jumpToCredits && visuals { enter(.say, 9, "SAY ANYTHING"); sayAnything() }
+    if !runControl.shouldSkipToCredits && visuals { enter(.say, 9, "SAY ANYTHING"); sayAnything() }
     // 10. Outro.
-    if !stopRequested {
-        jumpToCredits = false
-        inCredits = true
+    if runControl.beginCreditsScene() {
         enter(.outro, 10, "OUTRO")
         talk(voices[byeLine] ?? render(byeLine), text: byeLine)
         live { $0.scene = .outro }
         sparkle()
         if visuals {
-            keyPressed = false
+            runControl.setKeyPressed(false)
             live { $0.waitingForKey = true }
-            while !keyPressed && !stopRequested { usleep(20_000) }
+            while !runControl.keyPressed && !runControl.stopRequested { usleep(20_000) }
         } else {
             pause(1.0)
         }
@@ -1492,7 +1962,8 @@ func show(visuals: Bool) {
 
     let s = snapshot()
     if visuals { stopRenderer(); restoreTerminal() }
-    signOff(seconds: Int(now() - s.started), actuations: s.actuations)
+    let elapsed = max(0.0, now() - s.started)
+    signOff(seconds: elapsed.isFinite ? Int(min(elapsed, 86400.0)) : 0, actuations: s.actuations)
 }
 
 func signOff(seconds: Int, actuations: Int) {
@@ -1516,76 +1987,92 @@ func signOff(seconds: Int, actuations: Int) {
 
 // MARK: - Main
 
-var args = Array(CommandLine.arguments.dropFirst())
-/// The value after `flag` (and removes both), or nil if the flag isn't there. A flag with no value is a mistake.
-func option(_ flag: String, example: String) -> String? {
-    guard let i = args.firstIndex(of: flag) else { return nil }
-    guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else { usageError("\(flag) needs a value, like: \(flag) \(example)") }
-    let v = args[i + 1]; args.removeSubrange(i...(i + 1)); return v
-}
-func flag(_ f: String) -> Bool { if let i = args.firstIndex(of: f) { args.remove(at: i); return true }; return false }
-
-if flag("--help") || flag("-h") {
-    print("""
-    NO SPEAKER · a90.com presents
-    Your MacBook's trackpad has no speaker. This makes it talk anyway, through its haptic motor.
-
-      nospeaker                         the show (space skips a part, q goes to the end)
-      nospeaker "any words"             just say something
-      nospeaker --sweep                 a rising tone, 100 Hz to 4 kHz
-      --voice Daniel                    any voice from `say -v '?'`
-      --dark                            white on black instead of black on white
-      --plain                           no visuals
-
-    Mute your Mac: it still talks. Put it on a table, and keep your hands off the trackpad until it asks.
-    a90.com · x.com/codycollier
-    """)
-    exit(0)
-}
-
-voiceName = option("--voice", example: "Daniel")
-if let v = voiceName, !voiceExists(v) {
-    fail("There's no voice called \"\(v)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.", code: 64)
-}
-applyTheme(light: !flag("--dark"))
-let plain = flag("--plain")
-let wantsSweep = flag("--sweep")
-if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
-
-signal(SIGINT) { _ in requestEnd() }
-signal(SIGTERM) { _ in stopRequested = true }
-atexit { restoreTerminal() }
-
-motor = openMotor()
-motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()
-
-if wantsSweep || !args.isEmpty {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
-    if wantsSweep { print("sweeping 100 Hz → 4 kHz…"); sweep(seconds: 5) }
-    if !args.isEmpty {
-        let text = args.joined(separator: " ")
-        let frames = render(text)
-        print("trackpad: “\(text)”")
-        talk(frames, text: text)
+func runMain() {
+    var args = Array(CommandLine.arguments.dropFirst())
+    func option(_ flag: String, example: String) -> String? {
+        guard let i = args.firstIndex(of: flag) else { return nil }
+        guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else { usageError("\(flag) needs a value, like: \(flag) \(example)") }
+        let v = args[i + 1]; args.removeSubrange(i...(i + 1)); return v
     }
-} else {
-    let interactive = isatty(STDOUT_FILENO) == 1 && isatty(STDIN_FILENO) == 1
-    // Too small a window: say so, and start by itself as soon as it's big enough.
-    if !plain && interactive {
-        var size = terminalSize()
-        if size.w < 80 || size.h < 24 {
-            print("\n  nospeaker needs a slightly bigger window: at least 80 × 24.")
-            print("  Drag the window's corner to make it bigger, and it starts by itself.  (ctrl-c to stop)\n")
-            while (size.w < 80 || size.h < 24) && !stopRequested && !jumpToCredits {
-                usleep(200_000)
-                size = terminalSize()
+    func flag(_ f: String) -> Bool { if let i = args.firstIndex(of: f) { args.remove(at: i); return true }; return false }
+
+    if flag("--help") || flag("-h") {
+        print("""
+        NO SPEAKER · a90.com presents
+        Your MacBook's trackpad has no speaker. This makes it talk anyway, through its haptic motor.
+
+          nospeaker                         the show (space skips a part, q goes to the end)
+          nospeaker "any words"             just say something
+          nospeaker --sweep                 a rising tone, 100 Hz to 4 kHz
+          --voice Daniel                    any voice from `say -v '?'`
+          --dark                            white on black instead of black on white
+          --plain                           no visuals
+
+        Mute your Mac: it still talks. Put it on a table, and keep your hands off the trackpad until it asks.
+        a90.com · x.com/codycollier
+        """)
+        exit(0)
+    }
+
+    let selectedVoice = option("--voice", example: "Daniel")
+    if let v = selectedVoice, !voiceExists(v) {
+        fail("There's no voice called \"\(v)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.", code: 64)
+    }
+    appConfig.withLock { $0.voiceName = selectedVoice }
+    applyTheme(light: !flag("--dark"))
+    let plain = flag("--plain")
+    let wantsSweep = flag("--sweep")
+    if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
+
+    signal(SIGPIPE, SIG_IGN)
+    startSignalWatcher()
+    signal(SIGINT, handleSigInt)
+    signal(SIGTERM, handleSigTerm)
+    signal(SIGHUP, handleSigTerm)
+    signal(SIGQUIT, handleSigTerm)
+    atexit(onExitRestore)
+
+    motorRuntime.open()
+    defer {
+        stopTouch()
+        motorRuntime.closeMotor()
+    }
+
+    if wantsSweep || !args.isEmpty {
+        runControl.setCLIMode(true)
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
+        if wantsSweep { print("sweeping 100 Hz → 4 kHz…"); sweep(seconds: 5) }
+        if !args.isEmpty && !runControl.interrupted {
+            let text = args.joined(separator: " ")
+            let frames = render(text)
+            if !runControl.interrupted {
+                print("trackpad: “\(text)”")
+                talk(frames, text: text)
             }
-            if stopRequested || jumpToCredits { exit(0) }
         }
+    } else {
+        let interactive = isatty(STDOUT_FILENO) == 1 && isatty(STDIN_FILENO) == 1
+        // Too small a window: say so, and start by itself as soon as it's big enough.
+        if !plain && interactive {
+            var size = terminalSize()
+            if size.w < 80 || size.h < 24 {
+                runControl.setCLIMode(true)
+                print("\n  nospeaker needs a slightly bigger window: at least 80 × 24.")
+                print("  Drag the window's corner to make it bigger, and it starts by itself.  (ctrl-c to stop)\n")
+                while (size.w < 80 || size.h < 24) && !runControl.stopRequested {
+                    usleep(200_000)
+                    size = terminalSize()
+                }
+                if runControl.stopRequested { return }
+                runControl.setCLIMode(false)
+            }
+        }
+        let size = terminalSize()
+        let visuals = !plain && interactive && size.w >= 80 && size.h >= 24
+        if !visuals { runControl.setCLIMode(true) }
+        show(visuals: visuals)
     }
-    let size = terminalSize()
-    let visuals = !plain && interactive && size.w >= 80 && size.h >= 24
-    show(visuals: visuals)
+    usleep(120_000)
 }
-usleep(120_000)
-if let motor { _ = actuatorClose?(motor) }
+
+runMain()
